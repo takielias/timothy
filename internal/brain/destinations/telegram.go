@@ -69,16 +69,105 @@ func (a *TelegramAdapter) Deliver(ctx context.Context, config json.RawMessage, c
 		return fmt.Errorf("telegram adapter: resolve bot token: %w", err)
 	}
 
-	text := renderTelegramText(payload)
-	if err := a.sendMessage(ctx, token, cfg.ChatID, text); err != nil {
-		return fmt.Errorf("telegram adapter: send message: %w", err)
-	}
-	for _, f := range payload.Files {
-		if err := a.sendDocument(ctx, token, cfg.ChatID, f); err != nil {
-			return fmt.Errorf("telegram adapter: send document %s: %w", f.Name, err)
+	// Recipients want the mission's generated output, not a separate
+	// process digest alongside it — three cases, in priority order:
+	// text artifacts (.md/.txt) render inline as formatted, chunked
+	// MarkdownV2 messages (the bold title+date heads the first chunk);
+	// otherwise, non-text artifacts attach as files, with the same
+	// title+date on the first file's caption; only when there's neither
+	// does the plain completion-line message stand alone.
+	switch {
+	case len(payload.TextArtifacts) > 0:
+		if err := a.sendTextArtifacts(ctx, token, cfg.ChatID, payload); err != nil {
+			return fmt.Errorf("telegram adapter: send text artifacts: %w", err)
+		}
+	case len(payload.Files) > 0:
+		caption := renderTelegramCaption(payload)
+		for i, f := range payload.Files {
+			c := ""
+			if i == 0 {
+				c = caption
+			}
+			if err := a.sendDocument(ctx, token, cfg.ChatID, f, c); err != nil {
+				return fmt.Errorf("telegram adapter: send document %s: %w", f.Name, err)
+			}
+		}
+	default:
+		text := renderTelegramText(payload)
+		if err := a.sendMessage(ctx, token, cfg.ChatID, text); err != nil {
+			return fmt.Errorf("telegram adapter: send message: %w", err)
 		}
 	}
 	return nil
+}
+
+// sendTextArtifactSeparator visually separates consecutive text
+// artifacts within the same delivery when there's more than one —
+// each gets its own name heading, joined into one render pass so
+// chunking treats the whole set as one flow of blocks rather than
+// resetting per artifact (which could otherwise waste a chunk on a
+// single short trailing artifact).
+const sendTextArtifactSeparator = "\n\n---\n\n"
+
+// sendTextArtifacts renders every .md/.txt artifact as MarkdownV2,
+// heads the whole rendered content with the bold title + completion
+// date (same content the file-caption path would show), and sends it
+// as one or more sendMessage calls via ChunkMarkdownV2 — never a file
+// attachment, so a digest reads directly in the chat.
+func (a *TelegramAdapter) sendTextArtifacts(ctx context.Context, token, chatID string, payload Payload) error {
+	var sourceParts []string
+	for i, ta := range payload.TextArtifacts {
+		if i > 0 {
+			sourceParts = append(sourceParts, sendTextArtifactSeparator)
+		}
+		if len(payload.TextArtifacts) > 1 {
+			sourceParts = append(sourceParts, "## "+ta.Name+"\n\n")
+		}
+		sourceParts = append(sourceParts, ta.Content)
+	}
+	rendered := RenderMarkdownV2(strings.Join(sourceParts, ""))
+	header := renderTelegramCaption(payload)
+	full := rendered
+	if header != "" {
+		full = header + "\n\n" + rendered
+	}
+	chunks := ChunkMarkdownV2(full, telegramMessageLimit)
+	for _, chunk := range chunks {
+		if err := a.sendMessage(ctx, token, chatID, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// telegramCaptionLimit is the Bot API's sendDocument caption cap.
+const telegramCaptionLimit = 1024
+
+// renderTelegramCaption builds the bold title + completion date shown
+// above the first attached file — MarkdownV2, escaped. CompletedAt
+// zero (the ad-hoc deliver tool's payload, which never sets it) omits
+// the date line rather than guessing "now".
+func renderTelegramCaption(p Payload) string {
+	var b strings.Builder
+	b.WriteString("*")
+	b.WriteString(escapeMarkdownV2(p.Name))
+	b.WriteString("*")
+	if !p.CompletedAt.IsZero() {
+		b.WriteString("\n")
+		b.WriteString(escapeMarkdownV2(p.CompletedAt.Format("2 Jan 2006, 15:04 UTC")))
+	}
+	full := b.String()
+	if len(full) <= telegramCaptionLimit {
+		return full
+	}
+	cut := 0
+	for i, r := range full {
+		if i+len(string(r)) > telegramCaptionLimit {
+			break
+		}
+		cut = i + len(string(r))
+	}
+	return full[:cut]
 }
 
 // renderTelegramText builds the MarkdownV2 body: digest + links +
@@ -171,11 +260,19 @@ func (a *TelegramAdapter) sendMessage(ctx context.Context, token, chatID, text s
 	return a.call(ctx, token, "sendMessage", "application/json", bytes.NewReader(body))
 }
 
-func (a *TelegramAdapter) sendDocument(ctx context.Context, token, chatID string, f File) error {
+func (a *TelegramAdapter) sendDocument(ctx context.Context, token, chatID string, f File, caption string) error {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 	if err := w.WriteField("chat_id", chatID); err != nil {
 		return fmt.Errorf("build form: %w", err)
+	}
+	if caption != "" {
+		if err := w.WriteField("caption", caption); err != nil {
+			return fmt.Errorf("build form: %w", err)
+		}
+		if err := w.WriteField("parse_mode", "MarkdownV2"); err != nil {
+			return fmt.Errorf("build form: %w", err)
+		}
 	}
 	part, err := w.CreateFormFile("document", f.Name)
 	if err != nil {
