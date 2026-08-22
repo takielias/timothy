@@ -52,6 +52,30 @@ func TestApplyProviderOptionsReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestApplyProviderOptionsReasoningEffortByModel(t *testing.T) {
+	t.Parallel()
+	var row ProviderRow
+	optsJSON := `{"reasoning_effort": "low", "reasoning_effort_by_model": "{\"gpt-5.6-luna\": \"none\"}"}`
+	if err := applyProviderOptions(&row, []byte(optsJSON)); err != nil {
+		t.Fatalf("applyProviderOptions: %v", err)
+	}
+	if row.ReasoningEffort != "low" {
+		t.Fatalf("ReasoningEffort = %q, want low", row.ReasoningEffort)
+	}
+	if row.ReasoningEffortByModel["gpt-5.6-luna"] != "none" {
+		t.Fatalf("ReasoningEffortByModel[gpt-5.6-luna] = %q, want none", row.ReasoningEffortByModel["gpt-5.6-luna"])
+	}
+}
+
+func TestApplyProviderOptionsReasoningEffortByModelBadJSONFails(t *testing.T) {
+	t.Parallel()
+	var row ProviderRow
+	err := applyProviderOptions(&row, []byte(`{"reasoning_effort_by_model": "not json"}`))
+	if err == nil {
+		t.Fatal("applyProviderOptions: want error for malformed reasoning_effort_by_model, got nil")
+	}
+}
+
 // TestApplyProviderOptionsOpenAIResponses covers the tri-state
 // openai_responses flag (D-051 follow-up): absent must leave
 // OpenAIResponses nil (unknown, never guessed), "true"/"false" set a
