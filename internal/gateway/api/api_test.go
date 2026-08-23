@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -488,6 +490,62 @@ func TestStreamFailoverToSecondProvider(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(a.providerCalls.WithLabelValues("two", "coding", "ok")); got != 1 {
 		t.Fatalf("provider_calls_total{two,coding,ok} = %v, want 1", got)
+	}
+}
+
+// TestStreamFailoverCapturesFailedAttempt covers D-066's opt-in
+// diagnostics: with failureCaptureDir set, a failed-over attempt writes
+// one parseable JSON file containing the request messages and error
+// code.
+func TestStreamFailoverCapturesFailedAttempt(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	a, _ := newAPI(snapshotFor(t, oaiFail(t).URL, oaiOK(t, "backup").URL))
+	a.failureCaptureDir = dir
+
+	postJSON(t, a.handleStream, `{"route":"coding","messages":[{"role":"user","content":"hi"}]}`)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("capture files = %d, want 1 (only the failed attempt)", len(entries))
+	}
+	data, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var capture struct {
+		Route     string `json:"route"`
+		Provider  string `json:"provider"`
+		ErrorCode string `json:"error_code"`
+		Request   struct {
+			Messages []provider.Message `json:"messages"`
+		} `json:"request"`
+	}
+	if err := json.Unmarshal(data, &capture); err != nil {
+		t.Fatalf("Unmarshal capture file: %v", err)
+	}
+	if capture.Route != "coding" || capture.Provider != "one" || capture.ErrorCode != "http_401" {
+		t.Fatalf("capture = %+v, want route=coding provider=one error_code=http_401", capture)
+	}
+	if len(capture.Request.Messages) != 1 || capture.Request.Messages[0].Content != "hi" {
+		t.Fatalf("capture.Request.Messages = %+v, want the original request messages", capture.Request.Messages)
+	}
+}
+
+// TestStreamFailoverNoCaptureWhenDirUnset confirms capture is off by
+// default: no failureCaptureDir means no files written anywhere, even
+// when an attempt fails over.
+func TestStreamFailoverNoCaptureWhenDirUnset(t *testing.T) {
+	t.Parallel()
+	a, _ := newAPI(snapshotFor(t, oaiFail(t).URL, oaiOK(t, "backup").URL))
+
+	postJSON(t, a.handleStream, `{"route":"coding","messages":[{"role":"user","content":"hi"}]}`)
+
+	if a.failureCaptureDir != "" {
+		t.Fatalf("failureCaptureDir = %q, want empty (default)", a.failureCaptureDir)
 	}
 }
 

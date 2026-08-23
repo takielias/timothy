@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -36,16 +38,22 @@ type API struct {
 	ledger        ledger.Recorder
 	log           *slog.Logger
 	providerCalls *prometheus.CounterVec
+	// failureCaptureDir is GATEWAY_FAILURE_CAPTURE_DIR (D-066): empty
+	// (default) disables capture entirely.
+	failureCaptureDir string
 }
 
-// Register mounts the gateway API on the shared server.
-func Register(srv *httpserver.Server, store ConfigSource, rec ledger.Recorder, log *slog.Logger, m *metrics.Metrics) {
+// Register mounts the gateway API on the shared server. failureCaptureDir
+// is GATEWAY_FAILURE_CAPTURE_DIR — empty disables failed-attempt capture
+// (see captureFailure).
+func Register(srv *httpserver.Server, store ConfigSource, rec ledger.Recorder, log *slog.Logger, m *metrics.Metrics, failureCaptureDir string) {
 	a := &API{
 		store:  store,
 		ledger: rec,
 		log:    log,
 		providerCalls: m.NewCounterVec("provider_calls_total",
 			"Provider attempts by provider, route, and outcome.", "provider", "route", "status"),
+		failureCaptureDir: failureCaptureDir,
 	}
 	srv.Handle("POST /v1/stream", http.HandlerFunc(a.handleStream))
 	srv.Handle("POST /v1/embed", http.HandlerFunc(a.handleEmbed))
@@ -60,6 +68,45 @@ func Register(srv *httpserver.Server, store ConfigSource, rec ledger.Recorder, l
 func (a *API) recordAttempt(ctx context.Context, entry ledger.Entry) {
 	a.ledger.Record(ctx, entry)
 	a.providerCalls.WithLabelValues(entry.Provider, entry.Route, entry.Status).Inc()
+}
+
+// captureFailure writes one JSON file per failed-over provider attempt
+// to failureCaptureDir (D-066), when set — off by default. Debugging a
+// provider 400 otherwise means reaching for a stub provider just to see
+// the request the gateway actually sent, since a failed attempt is
+// dropped once its ledger row is written. A write failure here (bad
+// permissions, disk full) is logged and never affects the stream.
+func (a *API) captureFailure(entry ledger.Entry, route, purpose, providerName, model, reason string, completion provider.CompletionRequest) {
+	if a.failureCaptureDir == "" {
+		return
+	}
+	if err := os.MkdirAll(a.failureCaptureDir, 0o750); err != nil {
+		a.log.Warn("failure capture: mkdir failed", "dir", a.failureCaptureDir, "error", err)
+		return
+	}
+	capture := struct {
+		TS        time.Time                  `json:"ts"`
+		Route     string                     `json:"route"`
+		Purpose   string                     `json:"purpose"`
+		Provider  string                     `json:"provider"`
+		Model     string                     `json:"model"`
+		ErrorCode string                     `json:"error_code"`
+		Reason    string                     `json:"reason"`
+		Request   provider.CompletionRequest `json:"request"`
+	}{
+		TS: time.Now(), Route: route, Purpose: purpose,
+		Provider: providerName, Model: model,
+		ErrorCode: entry.ErrorCode, Reason: reason, Request: completion,
+	}
+	data, err := json.MarshalIndent(capture, "", "  ")
+	if err != nil {
+		a.log.Warn("failure capture: marshal failed", "error", err)
+		return
+	}
+	path := filepath.Join(a.failureCaptureDir, entry.ID+".json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		a.log.Warn("failure capture: write failed", "path", path, "error", err)
+	}
 }
 
 type streamRequest struct {
@@ -222,6 +269,7 @@ func (a *API) handleStream(w http.ResponseWriter, r *http.Request) {
 				"provider", att.ProviderName, "model", att.Model,
 				"route", req.Route, "code", res.entry.ErrorCode,
 				"reason", res.reason)
+			a.captureFailure(res.entry, req.Route, req.Purpose, att.ProviderName, att.Model, res.reason, completion)
 			codes = append(codes, res.entry.ErrorCode)
 			a.recordAttempt(r.Context(), res.entry)
 			if next := i + 1; next < len(attempts) {

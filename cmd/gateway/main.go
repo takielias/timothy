@@ -69,7 +69,9 @@ func main() {
 	led := ledger.New(app.DB, app.Log)
 	agg := ledger.NewAggregator(app.DB)
 	budgets := ledger.NewBudgetStore(app.DB)
-	api.Register(app.Server, store, led, app.Log, app.Metrics)
+	// GATEWAY_FAILURE_CAPTURE_DIR: opt-in local diagnostics, off by
+	// default (D-066) — see api.Register.
+	api.Register(app.Server, store, led, app.Log, app.Metrics, os.Getenv("GATEWAY_FAILURE_CAPTURE_DIR"))
 	api.RegisterUsage(app.Server, agg, budgets)
 	api.RegisterAdmin(app.Server, admin.New(app.DB, store, led, budgets, secrets, cat, app.Log))
 
