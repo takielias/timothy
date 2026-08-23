@@ -512,7 +512,7 @@ func TestStreamFailoverCapturesFailedAttempt(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("capture files = %d, want 1 (only the failed attempt)", len(entries))
 	}
-	data, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+	data, err := os.ReadFile(filepath.Join(dir, entries[0].Name())) //nolint:gosec // reads back this test's own t.TempDir capture file
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
