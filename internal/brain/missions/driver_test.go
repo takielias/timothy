@@ -283,7 +283,9 @@ func fakeSandboxExec(ctx context.Context, missionID, environment, workdir, comma
 }
 
 func testDriver(store driverStore, runner Runner) *Driver {
-	return NewDriver(store, runner, nil, nil, nil, nil, fakeSandboxExec, nil, slog.Default())
+	d := NewDriver(store, runner, nil, nil, nil, nil, fakeSandboxExec, nil, slog.Default())
+	d.retryDelayFn = func(int) time.Duration { return 0 } // tests drive worker_failed rounds back-to-back; no real sleeps
+	return d
 }
 
 // fakeFXRates scripts LatestUSDRates for the budget-brake conversion
@@ -2125,5 +2127,24 @@ func TestFailedReason(t *testing.T) {
 				t.Fatalf("failedReason(%+v) = %q, want %q", tc.events, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRetryDelay(t *testing.T) {
+	cases := []struct {
+		consecutiveFailures int
+		want                time.Duration
+	}{
+		{-1, 0},
+		{0, 0},
+		{1, 5 * time.Second},
+		{2, 15 * time.Second},
+		{3, 45 * time.Second},
+		{4, 45 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := retryDelay(tc.consecutiveFailures); got != tc.want {
+			t.Fatalf("retryDelay(%d) = %v, want %v", tc.consecutiveFailures, got, tc.want)
+		}
 	}
 }

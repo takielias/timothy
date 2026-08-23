@@ -144,6 +144,12 @@ type Driver struct {
 	// the clone.
 	resolveCloneToken CloneTokenResolver
 
+	// retryDelayFn paces a worker_failed retry (see retryDelay) —
+	// defaults to retryDelay in NewDriver, overridden to a zero-delay
+	// stub by tests that drive multiple worker_failed rounds and can't
+	// afford to actually sleep.
+	retryDelayFn func(consecutiveFailures int) time.Duration
+
 	// resolveCloneIdentity resolves a github-kind connector_id to the
 	// commit identity (name, email) ensureProvisioned sets as the
 	// clone's local git config (see SetCloneIdentityResolver) — nil-safe:
@@ -227,10 +233,33 @@ func NewDriver(store driverStore, runner Runner, workspace *Workspace, notify no
 	return &Driver{
 		store: store, runner: runner, workspace: workspace, notify: notify, sessions: sessions, perms: perms, log: log,
 		sandboxExec: sandboxExec, sandboxRemove: sandboxRemove,
-		cfg:         DefaultConfig,
-		gatekeepers: map[string]*GatekeeperState{},
-		driving:     map[string]bool{},
+		cfg:          DefaultConfig,
+		gatekeepers:  map[string]*GatekeeperState{},
+		driving:      map[string]bool{},
+		retryDelayFn: retryDelay,
 	}
+}
+
+// workerFailedRetryDelays paces retries after a worker_failed
+// transition (D-064): back-to-back Advance calls with no delay hammer
+// a failing model at ~1/sec until the backoff pause finally kicks in —
+// this ladder slows that down without changing when the pause itself
+// fires (stepWorkerFailed's cfg.BackoffFailures ceiling is unchanged).
+var workerFailedRetryDelays = [...]time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second}
+
+// retryDelay maps a post-transition ConsecutiveFailures count to a
+// delay from workerFailedRetryDelays, saturating at the last rung.
+// consecutiveFailures <= 0 returns 0 (shouldn't happen post-failure,
+// but never a negative sleep).
+func retryDelay(consecutiveFailures int) time.Duration {
+	if consecutiveFailures <= 0 {
+		return 0
+	}
+	idx := consecutiveFailures - 1
+	if idx >= len(workerFailedRetryDelays) {
+		idx = len(workerFailedRetryDelays) - 1
+	}
+	return workerFailedRetryDelays[idx]
 }
 
 // SetAgentResolver wires the resolver ensureProvisioned uses to grant
@@ -748,6 +777,19 @@ func (d *Driver) Advance(ctx context.Context, id string) (canContinue bool, err 
 	if d.notify != nil {
 		if err := d.notify.OnTransition(ctx, m, before, t.Next.Status, failedReason(t.Events)); err != nil {
 			d.log.Warn("driver: notify failed", "mission_id", id, "error", err)
+		}
+	}
+	// D-064: a worker_failed retry that stays working (mission.retry, not
+	// a pause/fail) paces the next Advance instead of spinning back-to-back
+	// against a failing model at ~1/sec until the backoff pause. Only this
+	// input paces — InputWorkerRetry is the worker actively progressing,
+	// not failing, so it must not slow down.
+	if in.Input == InputWorkerFailed && t.Next.Status == StatusWorking {
+		if delay := d.retryDelayFn(t.Next.ConsecutiveFailures); delay > 0 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(delay):
+			}
 		}
 	}
 	return t.Next.Status == StatusIdle || t.Next.Status == StatusWorking, nil
