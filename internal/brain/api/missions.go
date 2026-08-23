@@ -64,11 +64,11 @@ type missionAttachmentStore interface {
 // (not *attachments.Store) so the caller's own nil-box guard (a nil
 // *attachments.Store boxed here would be a non-nil interface value)
 // happens once, at the call site — same shape as chat.Service.SetAttachments.
-func (a *API) registerMissions(handle func(pattern string, h http.Handler), store *missions.Store, driver *missions.Driver, notifier *missions.Notifier, agentReg *agents.Store, workspace *missions.Workspace, resolveSecret func(context.Context, string) (string, error), routeForRole func(context.Context, string) string, classify agents.Classify, codingExecutorDefault func(context.Context) string, resolveExecutorOptions func(context.Context, string, string) (*gwclient.ResolvedRoute, error), nameMission func(context.Context, string) string, topModels func(context.Context, []string) (map[string]ledger.ModelUsed, error), conns *connectors.Manager, attachmentStore missionAttachmentStore, markitdownURL string, destinationLookupStore destinationLookup) {
+func (a *API) registerMissions(handle func(pattern string, h http.Handler), store *missions.Store, driver *missions.Driver, notifier *missions.Notifier, agentReg *agents.Store, workspace *missions.Workspace, resolveSecret func(context.Context, string) (string, error), routeForRole func(context.Context, string) string, classify agents.Classify, codingExecutorDefault func(context.Context) string, resolveExecutorOptions func(context.Context, string, string) (*gwclient.ResolvedRoute, error), nameMission func(context.Context, string) string, topModels func(context.Context, []string) (map[string]ledger.ModelUsed, error), conns *connectors.Manager, attachmentStore missionAttachmentStore, markitdownURL string) {
 	if store == nil {
 		return
 	}
-	h := &missionAPI{store: store, driver: driver, notifier: notifier, agentReg: agentReg, workspace: workspace, resolveSecret: resolveSecret, routeForRole: routeForRole, classify: classify, codingExecutorDefault: codingExecutorDefault, resolveExecutorOptions: resolveExecutorOptions, nameMission: nameMission, topModels: topModels, conns: conns, perms: a.perms, dir: a.dir, log: a.log, attachments: attachmentStore, markitdownURL: markitdownURL, markitdownHTTP: &http.Client{}, destinations: destinationLookupStore}
+	h := &missionAPI{store: store, driver: driver, notifier: notifier, agentReg: agentReg, workspace: workspace, resolveSecret: resolveSecret, routeForRole: routeForRole, classify: classify, codingExecutorDefault: codingExecutorDefault, resolveExecutorOptions: resolveExecutorOptions, nameMission: nameMission, topModels: topModels, conns: conns, perms: a.perms, dir: a.dir, log: a.log, attachments: attachmentStore, markitdownURL: markitdownURL, markitdownHTTP: &http.Client{}}
 	handle("GET /v1/missions", a.auth(http.HandlerFunc(h.list)))
 	handle("POST /v1/missions", a.auth(http.HandlerFunc(h.create)))
 	handle("POST /v1/missions/classify", a.auth(http.HandlerFunc(h.classifyGoal)))
@@ -150,14 +150,13 @@ type missionAPI struct {
 	// the operator-owned destinations table (D-061's exfiltration
 	// guard: an id must exist AND be enabled) — nil (destinations
 	// disabled) rejects any non-empty destination_ids.
-	destinations destinationLookup
 }
 
 // destinationLookup is the narrow slice of *destinations.Store the
-// mission create handler needs to validate destination_ids —
-// EnabledByID reports whether id names a real, enabled row (ok=false
-// covers both "unknown id" and "disabled", both rejected identically
-// by validateDestinationIDs below).
+// schedule handlers need to validate destination_ids — EnabledByID
+// reports whether id names a real, enabled row (ok=false covers both
+// "unknown id" and "disabled", both rejected identically). Mission
+// create validation moved into missions.ValidateCreate (D-071).
 type destinationLookup interface {
 	EnabledByID(ctx context.Context, id string) (ok bool, err error)
 }
@@ -178,35 +177,6 @@ func (h *missionAPI) routeExists(ctx context.Context, name string) bool {
 	return err == nil
 }
 
-// validateDestinationIDs rejects any id that doesn't name a real,
-// enabled destinations row — the exfiltration guard (D-061): a mission
-// create request only ever attaches operator-owned destinations, never
-// an arbitrary string the model might have supplied. Lists every
-// invalid id in one error, same spirit as an unknown-tool rejection
-// naming what's actually valid.
-func (h *missionAPI) validateDestinationIDs(ctx context.Context, ids []string) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	if h.destinations == nil {
-		return fmt.Errorf("destinations are not enabled")
-	}
-	var invalid []string
-	for _, id := range ids {
-		ok, err := h.destinations.EnabledByID(ctx, id)
-		if err != nil {
-			return fmt.Errorf("destination_ids: %w", err)
-		}
-		if !ok {
-			invalid = append(invalid, id)
-		}
-	}
-	if len(invalid) > 0 {
-		return fmt.Errorf("unknown or disabled destination id(s): %s", strings.Join(invalid, ", "))
-	}
-	return nil
-}
-
 func failMission(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, missions.ErrNotFound):
@@ -217,6 +187,8 @@ func failMission(w http.ResponseWriter, err error) {
 		jsonError(w, http.StatusConflict, "already_finished", err.Error())
 	case errors.Is(err, missions.ErrNotTerminal):
 		jsonError(w, http.StatusConflict, "not_terminal", err.Error())
+	case errors.Is(err, missions.ErrInvalidMission):
+		jsonError(w, http.StatusBadRequest, "bad_request", err.Error())
 	default:
 		jsonError(w, http.StatusBadRequest, "bad_request", err.Error())
 	}
@@ -427,43 +399,21 @@ func (h *missionAPI) create(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "bad_request", "goal is required")
 		return
 	}
-	switch req.Kind {
-	case "":
+	if req.Kind == "" {
 		req.Kind = classifyKind(r.Context(), h.classify, req.Goal)
-	case "coding", "general":
-	default:
-		jsonError(w, http.StatusBadRequest, "bad_request", `kind must be "coding" or "general"`)
-		return
-	}
-	if req.Light && req.Kind != "general" {
-		jsonError(w, http.StatusBadRequest, "bad_request", "light is only valid for kind=general missions")
-		return
 	}
 	if req.Harness == "native" {
 		req.Harness = ""
 	}
-	switch {
-	case req.Kind != "coding" && req.Harness != "":
-		jsonError(w, http.StatusBadRequest, "bad_request", "harness is only valid for kind=coding missions")
-		return
-	case req.Kind == "coding" && req.Harness == "":
-		if h.codingExecutorDefault != nil {
-			req.Harness = h.codingExecutorDefault(r.Context())
-		}
-	case req.Harness != "":
-		if _, ok := executor.Lookup(req.Harness); !ok {
-			jsonError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("unknown harness %q", req.Harness))
-			return
-		}
+	// codingExecutorDefault/environment auto-detect are HTTP-request-time
+	// resolution seams (settings lookup, goal-keyword heuristic) with no
+	// place in ValidateCreate's pure struct-shape rules; the resulting
+	// values still pass through ValidateCreate's kind/harness/environment
+	// checks below via Driver.Create.
+	if req.Kind == "coding" && req.Harness == "" && h.codingExecutorDefault != nil {
+		req.Harness = h.codingExecutorDefault(r.Context())
 	}
-	switch {
-	case req.Kind != "coding" && req.Environment != "":
-		jsonError(w, http.StatusBadRequest, "bad_request", "environment is only valid for kind=coding missions")
-		return
-	case !missions.ValidEnvironment(req.Environment):
-		jsonError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("unknown environment %q", req.Environment))
-		return
-	case req.Kind == "coding" && req.Environment == "":
+	if req.Kind == "coding" && req.Environment == "" {
 		// Auto-detect (D-05x), resolved server-side at create time so
 		// the environment is fixed before the sandbox container is ever
 		// created: no worktree exists yet (it's provisioned after this
@@ -473,17 +423,10 @@ func (h *missionAPI) create(w http.ResponseWriter, r *http.Request) {
 		// explicit request; "" stays "" (base) when nothing matches.
 		req.Environment, _ = missions.DetectEnvironment("", req.Goal)
 	}
-	switch {
-	case req.RepoURL != "" && req.Kind != "coding":
-		jsonError(w, http.StatusBadRequest, "bad_request", "repo_url is only valid for kind=coding missions")
-		return
-	case req.RepoURL != "" && req.ConnectorID == "":
-		jsonError(w, http.StatusBadRequest, "bad_request", "connector_id is required with repo_url")
-		return
-	case req.RepoURL == "" && req.ConnectorID != "":
-		jsonError(w, http.StatusBadRequest, "bad_request", "connector_id is only valid alongside repo_url")
-		return
-	case req.RepoURL != "":
+	// connector_id existence + kind check is a store lookup ValidateCreate
+	// can't perform (it takes no connectors dependency); repo_url's other
+	// shape rules (coding-only, requires connector_id) are ValidateCreate's.
+	if req.RepoURL != "" {
 		if h.conns == nil {
 			jsonError(w, http.StatusBadRequest, "bad_request", "connectors are not enabled")
 			return
@@ -497,31 +440,6 @@ func (h *missionAPI) create(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, http.StatusBadRequest, "bad_request", "connector_id must name a github-kind connector")
 			return
 		}
-	}
-	switch req.OnComplete {
-	case "":
-	case "push", "push_pr":
-		if req.Kind != "coding" || req.RepoURL == "" || req.ConnectorID == "" {
-			jsonError(w, http.StatusBadRequest, "bad_request", "on_complete requires repo_url and connector_id on a kind=coding mission")
-			return
-		}
-	default:
-		jsonError(w, http.StatusBadRequest, "bad_request", `on_complete must be "", "push", or "push_pr"`)
-		return
-	}
-	if req.BranchPattern != "" {
-		if err := missions.ValidateBranchPattern(req.BranchPattern); err != nil {
-			jsonError(w, http.StatusBadRequest, "bad_request", err.Error())
-			return
-		}
-	}
-	if err := missions.ValidateCommitStyle(req.CommitStyle); err != nil {
-		jsonError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if err := h.validateDestinationIDs(r.Context(), req.DestinationIDs); err != nil {
-		jsonError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
 	}
 	var parentMissionID, parentContext string
 	if req.ParentMissionID != "" {

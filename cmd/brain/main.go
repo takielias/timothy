@@ -37,6 +37,7 @@ import (
 	"github.com/SumonMSelim/timothy/internal/brain/skills"
 	"github.com/SumonMSelim/timothy/internal/brain/tools"
 	"github.com/SumonMSelim/timothy/internal/brain/tools/builtin"
+	"github.com/SumonMSelim/timothy/internal/brain/workflows"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/SumonMSelim/timothy/internal/gateway/ledger"
@@ -284,6 +285,36 @@ func main() {
 	}
 	if missionScheduler != nil && destinationStore != nil {
 		missionScheduler.SetDestinationEnabled(destinationStore.EnabledByID)
+	}
+	if missionDriver != nil {
+		// D-071: close the unvalidated Driver.Create path (the workflows
+		// engine's spawnStep is now a second caller besides the HTTP create
+		// handler). routeExists reuses the exact same gwc.ResolveRoute
+		// check buildMissions wires for the scheduler; destinationStore may
+		// still be nil (destinations disabled), which just skips that one
+		// check (see ValidateDeps' nil-gating).
+		deps := missions.ValidateDeps{
+			RouteExists: func(ctx context.Context, name string) bool {
+				_, err := gwc.ResolveRoute(ctx, name, "")
+				return err == nil
+			},
+		}
+		if destinationStore != nil {
+			deps.DestinationEnabled = destinationStore.EnabledByID
+		}
+		missionDriver.SetValidateDeps(deps)
+	}
+	// WORKFLOWS_ENABLED gates the orchestration-above-missions layer
+	// (D-070, slice 1): requires missions to already be enabled
+	// (WORKSPACES set), since a workflow step is just a follow-up
+	// mission the engine spawns.
+	var workflowStore *workflows.Store
+	var workflowEngine *workflows.Engine
+	if missionDriver != nil && os.Getenv("WORKFLOWS_ENABLED") != "" {
+		workflowStore = workflows.NewStore(app.DB, app.Log)
+		workflowEngine = workflows.NewEngine(workflowStore, missionDriver, missionStore, app.Log)
+		workflowEngine.SetRouteForRole(routeForRole)
+		missionDriver.SetOnTerminal(workflowEngine.OnMissionTerminal)
 	}
 	// deliver: chat-facing ad-hoc send to one operator-configured
 	// destination. Registered here, not inside buildAgent, for the same
@@ -550,7 +581,7 @@ func main() {
 	api.Register(app.Server, svc, store, broker,
 		memoryProxy(memorydURL, app.Log), adminProxy(gatewayURL, usageDecorator.Decorate, app.Log), flags, fxStore,
 		agentReg, conns, goog, secrets, agent, packs, missionStore, missionDriver, missionNotifier,
-		missionWorkspace, resolveSecret, routeForRole, chat.ClassifyOverGateway(gwc), gwc.ResolveRoute, chat.TitleOverGateway(gwc, app.Log), ledgerAgg.TopModelByMission, missionHub, attachmentStore, &http.Client{}, whisperURL, markitdownURL, token, app.Log, gwc, kbStore, mc, chat.ClassifyCollectionOverGateway(gwc, app.Log), destinationStore, destinationTest)
+		missionWorkspace, resolveSecret, routeForRole, chat.ClassifyOverGateway(gwc), gwc.ResolveRoute, chat.TitleOverGateway(gwc, app.Log), ledgerAgg.TopModelByMission, missionHub, attachmentStore, &http.Client{}, whisperURL, markitdownURL, token, app.Log, gwc, kbStore, mc, chat.ClassifyCollectionOverGateway(gwc, app.Log), destinationStore, destinationTest, workflowStore, workflowEngine)
 
 	if err := app.Run(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		app.Log.Error("server exited", "error", err)
