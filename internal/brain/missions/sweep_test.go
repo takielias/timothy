@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 )
 
 // fakeCapacityChecker scripts one Capacity call per test case.
@@ -62,5 +63,101 @@ func TestAdmitWork(t *testing.T) {
 				t.Errorf("reason = %q, want %q", reason, tc.wantReason)
 			}
 		})
+	}
+}
+
+// fakeBackoffStore scripts BackoffPaused/CountBackoffPauses for
+// autoResumeBackoff tests without a real Postgres pool.
+type fakeBackoffStore struct {
+	paused []BackoffPausedMission
+	counts map[string]int
+}
+
+func (f fakeBackoffStore) BackoffPaused(ctx context.Context) ([]BackoffPausedMission, error) {
+	return f.paused, nil
+}
+
+func (f fakeBackoffStore) CountBackoffPauses(ctx context.Context, missionID string) (int, error) {
+	return f.counts[missionID], nil
+}
+
+// fakeSignaler captures Signal calls for autoResumeBackoff tests.
+type fakeSignaler struct {
+	signaled []string
+}
+
+func (f *fakeSignaler) Signal(ctx context.Context, id string, input Input) error {
+	f.signaled = append(f.signaled, id)
+	return nil
+}
+
+// fakeMessageNotifier captures NotifyMessage calls for
+// autoResumeBackoff tests.
+type fakeMessageNotifier struct {
+	notified []string
+}
+
+func (f *fakeMessageNotifier) NotifyMessage(ctx context.Context, missionID, kind, message string) error {
+	f.notified = append(f.notified, missionID)
+	return nil
+}
+
+// TestAutoResumeBackoffLadder covers D-065's ladder boundaries: just
+// before each threshold, the mission is left alone; just after, it's
+// resumed. n>=4 never resumes, and notifies exactly once per tick.
+func TestAutoResumeBackoffLadder(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	now := time.Now()
+
+	cases := []struct {
+		name       string
+		n          int
+		since      time.Duration
+		wantResume bool
+		wantNotify bool
+	}{
+		{"n=1 just before 5m due", 1, 5*time.Minute - time.Second, false, false},
+		{"n=1 just after 5m due", 1, 5*time.Minute + time.Second, true, false},
+		{"n=2 just before 15m due", 2, 15*time.Minute - time.Second, false, false},
+		{"n=2 just after 15m due", 2, 15*time.Minute + time.Second, true, false},
+		{"n=3 just before 60m due", 3, 60*time.Minute - time.Second, false, false},
+		{"n=3 just after 60m due", 3, 60*time.Minute + time.Second, true, false},
+		{"n=4 exhausted, never resumes", 4, 999 * time.Hour, false, true},
+		{"n=5 exhausted, never resumes", 5, 999 * time.Hour, false, true},
+		{"n=0 no recorded pause yet, skipped", 0, 999 * time.Hour, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := fakeBackoffStore{
+				paused: []BackoffPausedMission{{ID: "m1", UpdatedAt: now.Add(-tc.since)}},
+				counts: map[string]int{"m1": tc.n},
+			}
+			signaler := &fakeSignaler{}
+			notifier := &fakeMessageNotifier{}
+			autoResumeBackoff(context.Background(), signaler, store, notifier, log)
+
+			if resumed := len(signaler.signaled) == 1; resumed != tc.wantResume {
+				t.Fatalf("signaled = %v, want resume=%v", signaler.signaled, tc.wantResume)
+			}
+			if notified := len(notifier.notified) == 1; notified != tc.wantNotify {
+				t.Fatalf("notified = %v, want notify=%v", notifier.notified, tc.wantNotify)
+			}
+		})
+	}
+}
+
+// TestAutoResumeBackoffNilNotifierSafe confirms a nil notifier (no
+// wiring, matching every other nil-safe hook in this package) never
+// panics on the exhausted path.
+func TestAutoResumeBackoffNilNotifierSafe(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := fakeBackoffStore{
+		paused: []BackoffPausedMission{{ID: "m1", UpdatedAt: time.Now().Add(-999 * time.Hour)}},
+		counts: map[string]int{"m1": 4},
+	}
+	signaler := &fakeSignaler{}
+	autoResumeBackoff(context.Background(), signaler, store, nil, log)
+	if len(signaler.signaled) != 0 {
+		t.Fatal("exhausted mission must never be resumed")
 	}
 }

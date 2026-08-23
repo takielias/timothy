@@ -1079,6 +1079,81 @@ func TestRecoverStaleWorking(t *testing.T) {
 	}
 }
 
+func TestBackoffPausedAndCountBackoffPauses(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+
+	backoffID, err := s.Create(ctx, Mission{Goal: marker + "backoff-paused", Kind: "general"})
+	if err != nil {
+		t.Fatalf("Create backoff: %v", err)
+	}
+	pauseBackoff := func() {
+		if err := s.ApplyTransition(ctx, backoffID, Transition{
+			Next:   StepState{Phase: PhaseExecute, Status: StatusPaused, PauseReason: PauseBackoff},
+			Events: []EventDraft{{Kind: "mission.paused", Payload: map[string]any{"reason": string(PauseBackoff)}}},
+		}); err != nil {
+			t.Fatalf("ApplyTransition pause backoff: %v", err)
+		}
+	}
+	pauseBackoff()
+
+	infraID, err := s.Create(ctx, Mission{Goal: marker + "infra-paused", Kind: "general"})
+	if err != nil {
+		t.Fatalf("Create infra: %v", err)
+	}
+	if err := s.ApplyTransition(ctx, infraID, Transition{
+		Next:   StepState{Phase: PhaseExecute, Status: StatusPaused, PauseReason: PauseInfra},
+		Events: []EventDraft{{Kind: "mission.paused", Payload: map[string]any{"reason": string(PauseInfra)}}},
+	}); err != nil {
+		t.Fatalf("ApplyTransition pause infra: %v", err)
+	}
+
+	paused, err := s.BackoffPaused(ctx)
+	if err != nil {
+		t.Fatalf("BackoffPaused: %v", err)
+	}
+	byID := map[string]bool{}
+	for _, m := range paused {
+		byID[m.ID] = true
+	}
+	if !byID[backoffID] {
+		t.Fatal("BackoffPaused did not return the backoff-paused mission")
+	}
+	if byID[infraID] {
+		t.Fatal("BackoffPaused incorrectly returned an infra-paused mission")
+	}
+
+	n, err := s.CountBackoffPauses(ctx, backoffID)
+	if err != nil {
+		t.Fatalf("CountBackoffPauses: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("CountBackoffPauses after 1 pause = %d, want 1", n)
+	}
+
+	// Resume, then pause for backoff again — count must accumulate.
+	if err := s.ApplyTransition(ctx, backoffID, Transition{Next: StepState{Phase: PhaseExecute, Status: StatusIdle}}); err != nil {
+		t.Fatalf("ApplyTransition resume: %v", err)
+	}
+	pauseBackoff()
+
+	n, err = s.CountBackoffPauses(ctx, backoffID)
+	if err != nil {
+		t.Fatalf("CountBackoffPauses after 2nd pause: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("CountBackoffPauses after 2 pauses = %d, want 2", n)
+	}
+
+	n, err = s.CountBackoffPauses(ctx, infraID)
+	if err != nil {
+		t.Fatalf("CountBackoffPauses infra: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("CountBackoffPauses for an infra-only mission = %d, want 0", n)
+	}
+}
+
 func TestSpendExcludesUnbilledRows(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
