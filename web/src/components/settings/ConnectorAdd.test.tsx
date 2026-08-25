@@ -12,6 +12,7 @@ vi.mock('../../api/client', () => ({
   setSecret: vi.fn(),
   testConnector: vi.fn(),
 }))
+vi.mock('sonner', () => ({ toast: { error: vi.fn(), success: vi.fn() } }))
 
 import {
   createConnector,
@@ -21,6 +22,7 @@ import {
   setSecret,
   testConnector,
 } from '../../api/client'
+import { toast } from 'sonner'
 
 function renderPage(presetId: string) {
   return render(
@@ -83,5 +85,83 @@ describe('ConnectorAdd existing-credential picker (github MCP token)', () => {
     fireEvent.click(await screen.findByLabelText('existing credential'))
     const option = await screen.findByRole('option', { name: /GMAIL_GOOGLE_OAUTH.*OAuth tokens \(managed by connector\)/ })
     expect(option).toHaveAttribute('aria-disabled', 'true')
+  })
+})
+
+describe('ConnectorAdd imap flow', () => {
+  it('tests then adds an imap connector with host/username/password', async () => {
+    vi.mocked(createConnector).mockResolvedValue('conn-imap')
+    vi.mocked(testConnector).mockResolvedValue({ ok: true })
+    vi.mocked(patchConnector).mockResolvedValue()
+    renderPage('imap')
+
+    fireEvent.change(await screen.findByPlaceholderText('imap.example.com'), {
+      target: { value: 'imap.fastmail.com' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('me@example.com'), {
+      target: { value: 'me@fastmail.com' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('password'), { target: { value: 'app-password' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }))
+    await waitFor(() => expect(createConnector).toHaveBeenCalled())
+    expect(vi.mocked(createConnector).mock.calls[0][0]).toMatchObject({
+      kind: 'imap',
+      config: { host: 'imap.fastmail.com', username: 'me@fastmail.com' },
+      enabled: false,
+    })
+    expect(setSecret).toHaveBeenCalledWith(expect.stringContaining('_IMAP_PASSWORD'), 'app-password')
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add connector' }))
+    await waitFor(() => expect(patchConnector).toHaveBeenCalledWith('conn-imap', { enabled: true }))
+  })
+
+  it('rejects an invalid port and does not create a connector', async () => {
+    renderPage('imap')
+
+    fireEvent.change(await screen.findByPlaceholderText('imap.example.com'), {
+      target: { value: 'imap.fastmail.com' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('me@example.com'), {
+      target: { value: 'me@fastmail.com' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('password'), { target: { value: 'app-password' } })
+    fireEvent.change(screen.getByPlaceholderText('993'), { target: { value: '143a' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }))
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Invalid port', expect.anything()))
+    expect(createConnector).not.toHaveBeenCalled()
+  })
+})
+
+describe('ConnectorAdd caldav flow', () => {
+  it('tests then adds a caldav connector with url/username/password', async () => {
+    vi.mocked(createConnector).mockResolvedValue('conn-caldav')
+    vi.mocked(testConnector).mockResolvedValue({ ok: true })
+    vi.mocked(patchConnector).mockResolvedValue()
+    renderPage('caldav')
+
+    fireEvent.change(await screen.findByPlaceholderText('https://cal.example.com/dav/calendars/user/personal/'), {
+      target: { value: 'https://cal.fastmail.com/dav/calendars/user/me@fastmail.com/cal/' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('me@example.com'), {
+      target: { value: 'me@fastmail.com' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('password'), { target: { value: 'app-password' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }))
+    await waitFor(() => expect(createConnector).toHaveBeenCalled())
+    expect(vi.mocked(createConnector).mock.calls[0][0]).toMatchObject({
+      kind: 'caldav',
+      config: {
+        url: 'https://cal.fastmail.com/dav/calendars/user/me@fastmail.com/cal/',
+        username: 'me@fastmail.com',
+      },
+      enabled: false,
+    })
+    expect(setSecret).toHaveBeenCalledWith(expect.stringContaining('_CALDAV_PASSWORD'), 'app-password')
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add connector' }))
+    await waitFor(() => expect(patchConnector).toHaveBeenCalledWith('conn-caldav', { enabled: true }))
   })
 })
