@@ -581,6 +581,10 @@ export interface AdminAgent {
   review_route?: string
   budget_usd?: number
   approval_allowlist?: string[]
+  // Harness this agent's coding missions delegate to when the mission
+  // itself leaves harness empty (mission.harness -> agent.harness ->
+  // settings.coding_executor -> native). Empty means inherit.
+  harness?: string
 }
 
 // AdminTool is one entry of the live tool surface (builtins +
@@ -701,6 +705,15 @@ export interface Mission {
   // on instead of route — "" means route covers everything.
   plan_route?: string
   escalation_route?: string
+  // route_model/plan_route_model/review_route_model pin one phase axis
+  // to one exact chain entry ("provider name/model") in the route it
+  // would otherwise resolve — "" or absent keeps the first-usable walk.
+  // Precedence mirrors the route fields: route_model backs execute,
+  // plan_route_model backs explore/plan, review_route_model falls back
+  // review_route_model > plan_route_model > route_model.
+  route_model?: string
+  plan_route_model?: string
+  review_route_model?: string
   pending_permission?: string
   pending_permission_tool?: string
   pending_permission_args?: string
@@ -1002,4 +1015,44 @@ export interface Schedule {
   pending_fire: boolean
   last_skipped_at?: string
   skip_reason?: string
+}
+
+// ExecutionPlanPrices mirrors CatalogPrice's price shape for one
+// execution plan entry's model. Absent entirely when unpriced -
+// never a guessed number.
+export interface ExecutionPlanPrices {
+  input_per_mtok?: number
+  output_per_mtok?: number
+  cache_read_per_mtok?: number
+  cache_write_per_mtok?: number
+}
+
+// ExecutionPlanEntry is one chain entry's resolution within a phase -
+// the full ordered list, not just the winner (GET
+// /v1/missions/execution-plan). selected is true on the first usable
+// entry only; nothing is selected if none are usable.
+export interface ExecutionPlanEntry {
+  provider_name: string
+  model: string
+  usable: boolean
+  skip_reason: string
+  selected: boolean
+  prices?: ExecutionPlanPrices
+}
+
+// ExecutionPlanPhase is one of the five fixed mission phases (explore,
+// plan, execute, review, escalate) resolved server-side. axis is
+// 'native' or 'harness' - only execute is ever 'harness'.
+// route_source/harness_source name provenance for the phase table's
+// "(from agent)" style annotations.
+export interface ExecutionPlanPhase {
+  phase: string
+  route: string
+  route_source: string
+  axis: string
+  harness: string
+  harness_source: string
+  skipped: boolean
+  skip_reason: string
+  entries: ExecutionPlanEntry[]
 }

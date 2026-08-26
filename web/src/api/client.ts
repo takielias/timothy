@@ -18,6 +18,7 @@ import type {
   ChatRequest,
   Destination,
   EntityGraphData,
+  ExecutionPlanPhase,
   GitHubIdentity,
   GitHubRepo,
   GroupTotal,
@@ -1229,6 +1230,14 @@ export interface CreateMissionInput {
   // on instead of route — omit (or "") to use route for everything.
   plan_route?: string
   escalation_route?: string
+  // route_model/plan_route_model/review_route_model pin one phase axis
+  // to one exact chain entry ("provider name/model") in the route it
+  // would otherwise resolve — omit (or "") to keep the first-usable
+  // walk. See ExecutionPlanEntry's provider_name+model for the pair a
+  // pin names.
+  route_model?: string
+  plan_route_model?: string
+  review_route_model?: string
   max_iterations?: number
   budget_amount?: number
   budget_currency?: string
@@ -1296,6 +1305,42 @@ export async function getMissionExecutorOptions(route?: string): Promise<Executo
     `/v1/missions/executor-options${qs}`,
   )
   return options ?? []
+}
+
+// getMissionExecutionPlan resolves all five mission phases (explore,
+// plan, execute, review, escalate) server-side for the given create
+// inputs, so the frontend never mirrors route/harness precedence
+// itself. Params match the create form's own fields; all optional.
+export async function getMissionExecutionPlan(params: {
+  kind?: string
+  agent?: string
+  harness?: string
+  route?: string
+  plan_route?: string
+  review_route?: string
+  escalation_route?: string
+  route_model?: string
+  plan_route_model?: string
+  review_route_model?: string
+  light?: boolean
+}): Promise<ExecutionPlanPhase[]> {
+  const qs = new URLSearchParams()
+  if (params.kind) qs.set('kind', params.kind)
+  if (params.agent) qs.set('agent', params.agent)
+  if (params.harness) qs.set('harness', params.harness)
+  if (params.route) qs.set('route', params.route)
+  if (params.plan_route) qs.set('plan_route', params.plan_route)
+  if (params.review_route) qs.set('review_route', params.review_route)
+  if (params.escalation_route) qs.set('escalation_route', params.escalation_route)
+  if (params.route_model) qs.set('route_model', params.route_model)
+  if (params.plan_route_model) qs.set('plan_route_model', params.plan_route_model)
+  if (params.review_route_model) qs.set('review_route_model', params.review_route_model)
+  if (params.light) qs.set('light', 'true')
+  const query = qs.toString()
+  const { phases } = await request<{ phases: ExecutionPlanPhase[] }>(
+    `/v1/missions/execution-plan${query ? `?${query}` : ''}`,
+  )
+  return phases ?? []
 }
 
 // listMissions returns every mission by default; opts narrows to one
