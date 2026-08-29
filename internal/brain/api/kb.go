@@ -23,6 +23,18 @@ import (
 // maxKBUploadBytes caps a single knowledge-base document upload.
 const maxKBUploadBytes = 32 << 20 // 32MiB
 
+// maxClipMarkdownBytes caps a browser-extension clip's markdown,
+// mirroring markitdown's own output cap (markitdown.TruncateMarkdown).
+const maxClipMarkdownBytes = 128 << 10 // 128KiB
+
+// clipTitleInputRunes bounds how much markdown a clip with no title
+// feeds to the titler; clipTitleMaxRunes bounds the generated title
+// itself.
+const (
+	clipTitleInputRunes = 2000
+	clipTitleMaxRunes   = 200
+)
+
 // kbAllowedExt names the file extensions kb document upload accepts.
 // .md/.txt skip markitdown entirely (already markdown/plain text);
 // everything else converts through the sidecar.
@@ -44,14 +56,19 @@ type kbIngester interface {
 // classifier itself): a document must always resolve to some choice.
 type kbClassifier func(ctx context.Context, docTitle, docText string, collections []kb.Collection) chat.CollectionChoice
 
+// kbTitler generates a document title from a markdown excerpt —
+// chat.TitleOverGateway in production, faked in tests. Never errors;
+// an empty return means the caller falls back to titleFromURL.
+type kbTitler func(ctx context.Context, input string) string
+
 // registerKB mounts the knowledge-base admin surface (D-060). Nil
 // store leaves it unmounted, same nil-gate pattern as agents/skills.
-func (a *API) registerKB(handle func(pattern string, h http.Handler), store *kb.Store, ingest kbIngester, markitdownURL string, classify kbClassifier) {
+func (a *API) registerKB(handle func(pattern string, h http.Handler), store *kb.Store, ingest kbIngester, markitdownURL string, classify kbClassifier, title kbTitler) {
 	if store == nil {
 		return
 	}
 	h := &kbAPI{
-		store: store, ingest: ingest, markitdownURL: markitdownURL, classify: classify,
+		store: store, ingest: ingest, markitdownURL: markitdownURL, classify: classify, title: title,
 		markitdownHTTP: &http.Client{},
 		fetchHTTP:      &http.Client{Timeout: kbURLFetchTimeout, Transport: kbFetchTransport},
 		log:            a.log,
@@ -66,6 +83,7 @@ func (a *API) registerKB(handle func(pattern string, h http.Handler), store *kb.
 	handle("POST /v1/admin/kb/collections/{id}/documents/url", a.auth(http.HandlerFunc(h.addDocumentFromURL)))
 	handle("POST /v1/admin/kb/documents", a.auth(http.HandlerFunc(h.uploadDocumentAuto)))
 	handle("POST /v1/admin/kb/documents/url", a.auth(http.HandlerFunc(h.addDocumentFromURLAuto)))
+	handle("POST /v1/admin/kb/documents/clip", a.auth(http.HandlerFunc(h.clipDocument)))
 	handle("DELETE /v1/admin/kb/documents/{id}", a.auth(http.HandlerFunc(h.deleteDocument)))
 	handle("POST /v1/admin/kb/documents/{id}/reingest", a.auth(http.HandlerFunc(h.reingestDocument)))
 }
@@ -74,6 +92,7 @@ type kbAPI struct {
 	store          *kb.Store
 	ingest         kbIngester
 	classify       kbClassifier
+	title          kbTitler
 	markitdownURL  string
 	markitdownHTTP *http.Client
 	// fetchHTTP fetches user-supplied URLs; production wires it through
@@ -394,11 +413,45 @@ func (h *kbAPI) decodeURL(w http.ResponseWriter, r *http.Request, req kbURLReque
 	if title == "" {
 		title = titleFromURL(u)
 	}
-	return decodedURL{title: title, url: u.String(), markdown: markdownText, rawBytes: int64(len(body))}, true
+	return decodedURL{title: title, url: normalizeSourceURL(u), markdown: markdownText, rawBytes: int64(len(body))}, true
+}
+
+// refreshOrCreate looks up an existing document by (sourceType,
+// sourceRef). On a hit it refreshes the row in place (200 OK), moving
+// it to moveTo ("" keeps the current collection). On a miss it calls
+// resolveCollectionID to pick a collection (classifying or using the
+// caller's choice) and creates a new document (201 Created).
+func (h *kbAPI) refreshOrCreate(w http.ResponseWriter, r *http.Request, resolveCollectionID func() (string, error), moveTo, title, sourceType, sourceRef, markdownText string, size int64) {
+	existing, err := h.store.FindDocumentBySource(r.Context(), sourceType, sourceRef)
+	switch {
+	case errors.Is(err, kb.ErrNotFound):
+		collectionID, err := resolveCollectionID()
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "kb_failed", err.Error())
+			return
+		}
+		h.finishIngest(w, r, collectionID, title, sourceType, sourceRef, markdownText, size)
+	case err != nil:
+		jsonError(w, http.StatusInternalServerError, "kb_failed", err.Error())
+	default:
+		if err := h.store.ReplaceDocumentContent(r.Context(), existing.ID, title, markdownText, size, moveTo); err != nil {
+			failKB(w, err)
+			return
+		}
+		h.startIngest(existing.ID, title)
+		doc, err := h.store.GetDocument(r.Context(), existing.ID)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "kb_failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, sanitizeDocument(doc))
+	}
 }
 
 // addDocumentFromURL fetches a user-supplied URL into a caller-chosen
-// collection.
+// collection. Re-adding an already-known URL (by source_type=url,
+// source_ref=normalized URL) refreshes the existing document in place,
+// moving it to collectionID since the operator explicitly chose it.
 func (h *kbAPI) addDocumentFromURL(w http.ResponseWriter, r *http.Request) {
 	collectionID := r.PathValue("id")
 	if _, err := h.store.GetCollection(r.Context(), collectionID); err != nil {
@@ -414,12 +467,15 @@ func (h *kbAPI) addDocumentFromURL(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	h.finishIngest(w, r, collectionID, d.title, "url", d.url, d.markdown, d.rawBytes)
+	resolve := func() (string, error) { return collectionID, nil }
+	h.refreshOrCreate(w, r, resolve, collectionID, d.title, "url", d.url, d.markdown, d.rawBytes)
 }
 
 // addDocumentFromURLAuto fetches a user-supplied URL with no collection
 // chosen: the document is classified against existing collections (or
-// files into a newly proposed one) before ingest.
+// files into a newly proposed one) before ingest. Re-adding an
+// already-known URL refreshes it in place and keeps its current
+// collection, skipping the classifier.
 func (h *kbAPI) addDocumentFromURLAuto(w http.ResponseWriter, r *http.Request) {
 	var req kbURLRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -430,12 +486,143 @@ func (h *kbAPI) addDocumentFromURLAuto(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	collectionID, err := h.resolveCollection(r.Context(), d.title, d.markdown)
-	if err != nil {
-		jsonError(w, http.StatusInternalServerError, "kb_failed", err.Error())
+	resolve := func() (string, error) { return h.resolveCollection(r.Context(), d.title, d.markdown) }
+	h.refreshOrCreate(w, r, resolve, "", d.title, "url", d.url, d.markdown, d.rawBytes)
+}
+
+// kbClipRequest is a browser-extension clip: the extension converts the
+// page to markdown client-side, so this path never fetches or converts
+// anything itself.
+type kbClipRequest struct {
+	URL          string `json:"url"`
+	Title        string `json:"title"`
+	Markdown     string `json:"markdown"`
+	CollectionID string `json:"collection_id"`
+}
+
+// normalizeSourceURL is the url/clip dedup key: fragment dropped, and
+// tracking query parameters (fbclid, gclid, utm_*) stripped. The clip
+// extension already strips these client-side; this re-strips as
+// defense so a stray tracking param never splits one page into two
+// documents.
+func normalizeSourceURL(u *url.URL) string {
+	out := *u
+	out.Fragment = ""
+	q := out.Query()
+	for key := range q {
+		lower := strings.ToLower(key)
+		if lower == "fbclid" || lower == "gclid" || strings.HasPrefix(lower, "utm_") {
+			q.Del(key)
+		}
+	}
+	out.RawQuery = q.Encode()
+	return out.String()
+}
+
+// truncateRunes cuts s to at most n runes, not bytes (titles and
+// markdown excerpts can carry multi-byte UTF-8).
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
+
+// clipDocument ingests a browser-extension clip: the extension sends
+// pre-converted markdown, so this handler validates and stores it
+// directly, with no fetch and no markitdown conversion. Re-clipping an
+// already-known URL (by source_type=clip, source_ref=normalized URL)
+// refreshes the existing document in place rather than creating a
+// duplicate.
+func (h *kbAPI) clipDocument(w http.ResponseWriter, r *http.Request) {
+	var req kbClipRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	h.finishIngest(w, r, collectionID, d.title, "url", d.url, d.markdown, d.rawBytes)
+
+	u, err := url.Parse(strings.TrimSpace(req.URL))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		jsonError(w, http.StatusBadRequest, "bad_request", "url must be a full http:// or https:// URL")
+		return
+	}
+	u.User = nil
+
+	markdownText := strings.TrimSpace(req.Markdown)
+	if markdownText == "" {
+		jsonError(w, http.StatusBadRequest, "bad_request", "markdown is required")
+		return
+	}
+	if len(req.Markdown) > maxClipMarkdownBytes {
+		jsonError(w, http.StatusRequestEntityTooLarge, "too_large", "markdown exceeds the 128KiB limit")
+		return
+	}
+
+	collectionID := strings.TrimSpace(req.CollectionID)
+	if collectionID != "" {
+		if _, err := h.store.GetCollection(r.Context(), collectionID); err != nil {
+			failKB(w, err)
+			return
+		}
+	}
+
+	// Sanitize the same as every other ingest path: converted (or here,
+	// extension-supplied) markdown can carry NUL bytes or invalid UTF-8,
+	// which Postgres text columns reject (22021).
+	markdownText = strings.ToValidUTF8(strings.ReplaceAll(req.Markdown, "\x00", ""), "�")
+
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		if h.title != nil {
+			title = truncateRunes(strings.TrimSpace(h.title(r.Context(), truncateRunes(markdownText, clipTitleInputRunes))), clipTitleMaxRunes)
+		}
+		if title == "" {
+			title = titleFromURL(u)
+		}
+	}
+
+	sourceRef := normalizeSourceURL(u)
+	existing, err := h.store.FindDocumentBySource(r.Context(), "clip", sourceRef)
+	switch {
+	case errors.Is(err, kb.ErrNotFound):
+		if collectionID == "" {
+			collectionID, err = h.resolveCollection(r.Context(), title, markdownText)
+			if err != nil {
+				jsonError(w, http.StatusInternalServerError, "kb_failed", err.Error())
+				return
+			}
+		}
+		docID, err := h.store.CreateDocument(r.Context(), collectionID, title, "clip", sourceRef, markdownText, int64(len(markdownText)))
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "kb_failed", err.Error())
+			return
+		}
+		h.startIngest(docID, title)
+		doc, err := h.store.GetDocument(r.Context(), docID)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "kb_failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, sanitizeDocument(doc))
+	case err != nil:
+		jsonError(w, http.StatusInternalServerError, "kb_failed", err.Error())
+	default:
+		// Re-clip: refresh the existing document rather than duplicate
+		// it. startIngest's memoryd call deletes the old chunks before
+		// writing the new set (same as reingestDocument).
+		if err := h.store.ReplaceDocumentContent(r.Context(), existing.ID, title, markdownText, int64(len(markdownText)), collectionID); err != nil {
+			failKB(w, err)
+			return
+		}
+		h.startIngest(existing.ID, title)
+		doc, err := h.store.GetDocument(r.Context(), existing.ID)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "kb_failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, sanitizeDocument(doc))
+	}
 }
 
 // fetchURL GETs u, capping the body at maxKBUploadBytes, and returns
