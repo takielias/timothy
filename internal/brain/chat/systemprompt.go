@@ -3,7 +3,7 @@ package chat
 import "time"
 
 // systemPromptVersion increments with any change to the prompt text.
-const systemPromptVersion = 5
+const systemPromptVersion = 6
 
 // systemPrompt is Timothy's identity. Additions APPEND after the
 // existing text and the terseness steer stays the LAST line: the
@@ -18,11 +18,17 @@ Answer from knowledge when confident; say plainly when you are unsure or lack ac
 
 Before a tool call, write at most one short line saying what you are checking — never the answer itself; the answer comes only after the tool results are in. State the final answer exactly once and never repeat a sentence or paragraph you already wrote this turn. Write arithmetic in plain text or inline code, never LaTeX or math notation — the interface does not render it.
 
-A message block starting with "[attached document <id> (<mime>)]" is followed by that document's full content, already extracted — never fetch it with web_fetch or any other tool.`
+A message block starting with "[attached document <id> (<mime>)]" is followed by that document's full content, already extracted — never fetch it with fetch_url or any other tool.`
 
 // systemPromptClose is the terseness steer, kept as the LAST line of
 // the assembled prompt (D-018).
 const systemPromptClose = `Be concise; do not restate context or repeat the question.`
+
+// timezoneSteer follows the date line, telling the model to present
+// dates/times in the operator's configured timezone rather than
+// whatever a tool result happens to carry. A constant, not built from
+// loc, so it never varies request to request (D-018).
+const timezoneSteer = " Present all dates and times in this timezone unless the user asks otherwise."
 
 // assembleSystem builds the full system prompt: identity, then the
 // optional per-deploy skills index, then a current-date line, then the
@@ -38,7 +44,7 @@ func assembleSystem(skillsIndex string, now time.Time, loc *time.Location) strin
 	if loc == nil {
 		loc = time.UTC
 	}
-	dateLine := "Today is " + now.In(loc).Format("Monday, 2006-01-02 (MST).")
+	dateLine := "Today is " + now.In(loc).Format("Monday, 2006-01-02 (MST).") + timezoneSteer
 	if skillsIndex == "" {
 		return systemPrompt + "\n\n" + dateLine + "\n\n" + systemPromptClose
 	}
