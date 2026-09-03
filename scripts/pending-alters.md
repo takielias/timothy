@@ -25,3 +25,12 @@ UPDATE agents SET tools = tools || '["share_file"]'::jsonb
 UPDATE agents SET tools = tools || '["generate_pdf"]'::jsonb
   WHERE name IN ('general', 'researcher') AND NOT tools ? 'generate_pdf';
 ```
+
+## Transcribe-mode plan flag (D-102, issue #496)
+
+Required on live DBs before/with the next deploy. Additive, safe to
+run before deploy.
+
+```sql
+ALTER TABLE missions ADD COLUMN IF NOT EXISTS has_plan boolean NOT NULL DEFAULT false;
+```
