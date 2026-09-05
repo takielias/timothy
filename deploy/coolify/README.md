@@ -40,7 +40,6 @@ three:
 | `TIMOTHY_API_TOKEN` | `openssl rand -hex 32` |
 | `TIMOTHY_PUBLIC_URL` | The public HTTPS URL, e.g. `https://timothy.example.com` |
 | `DOCKER_SOCK_GID` | `stat -c '%g' /var/run/docker.sock` on the Coolify host |
-| `SEARXNG_CONFIG_DIR` | Optional; host directory holding searxng's `settings.yml` (default `/data/coolify/timothy/searxng`) |
 
 `TIMOTHY_PUBLIC_URL` builds the connector OAuth redirect; that URL plus
 `/v1/connectors/oauth/callback` is what goes in the Google OAuth client's
@@ -66,25 +65,7 @@ Assign the domain to the **`web`** service, port 8080. Nothing else is
 reachable from outside: `web`'s nginx proxies `/v1` to `brain` on the
 internal network, and no service publishes a host port.
 
-## 4. searxng config
-
-Coolify rewrites relative bind sources into `/data/coolify/applications/<uuid>`
-rather than the git checkout, so a repo-relative path never reaches
-`deploy/searxng/settings.yml`. The compose binds an absolute host path
-instead; create it once per host:
-
-```sh
-sudo mkdir -p /data/coolify/timothy/searxng
-sudo curl -fsSL https://raw.githubusercontent.com/timothy-agent/timothy/main/deploy/searxng/settings.yml \
-  -o /data/coolify/timothy/searxng/settings.yml
-```
-
-Override the location with `SEARXNG_CONFIG_DIR` if `/data/coolify/timothy` does
-not suit. Skip this and docker creates an empty directory in its place, and
-searxng crash-loops on `"/etc/searxng/settings.yml" is not a valid file`,
-taking the deployment with it.
-
-## 5. Mission sandbox image
+## 4. Mission sandbox image
 
 `MISSION_SANDBOX_IMAGE` is an environment variable `sandboxd` hands to
 the Docker socket, not a compose service, so `docker compose pull` never
@@ -97,10 +78,10 @@ docker pull ghcr.io/timothy-agent/timothy-sandbox:<TIMOTHY_VERSION>
 Skip this and missions fail at first sandbox start. Repeat on every
 upgrade.
 
-## 6. Verify
+## 5. Verify
 
 ```sh
-# searxng config resolved (1 = the json format brain's search_web needs)
+# searxng got its inline config (1 = the json format search_web needs)
 docker exec <searxng-container> grep -c json /etc/searxng/settings.yml
 
 # proxy is routing to web
@@ -115,7 +96,7 @@ first provider bootstraps them.
 
 ## Upgrading
 
-Bump `TIMOTHY_VERSION`, pull the matching sandbox image (step 5), and
+Bump `TIMOTHY_VERSION`, pull the matching sandbox image (step 4), and
 redeploy. Migrations run automatically on start. Downgrading is not
 supported once a newer version's migrations have run.
 

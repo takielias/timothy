@@ -3,13 +3,13 @@
 # Set Base Directory to /deploy/coolify and Compose file to
 # docker-compose.yml. Coolify rewrites relative bind sources into its own
 # application data directory rather than the git checkout, so the searxng
-# config below is bound from an absolute host path the operator populates
-# once from deploy/searxng/settings.yml — see README step 4.
+# config travels as an inline compose config instead of a bind — no host
+# path, no operator step.
 #
 # Deltas from deploy/release/docker-compose.yml (which targets a flat
 # install directory, not a repo checkout):
 #   - no top-level `name:` — Coolify sets --project-name itself
-#   - searxng config bound from an absolute host path, not ./searxng
+#   - searxng config as an inline compose config, not a ./searxng bind
 #   - no published host ports; Coolify's proxy terminates TLS and
 #     routes to `web`, and web's nginx proxies /v1 to brain same-origin
 #
@@ -60,20 +60,20 @@ services:
     image: searxng/searxng@sha256:aaf56bb5ad737d48a8a375778d42eb4ab1757231e6b1eb7980e71d8dd5bdf0de
     environment:
       SEARXNG_BASE_URL: http://searxng:8080/
-    volumes:
-      # An absolute host path, not a repo-relative one: Coolify rewrites
-      # relative bind sources into its own application data directory
-      # (/data/coolify/applications/<uuid>), not the git checkout, so
-      # neither ./searxng nor ../searxng ever reaches this repo's copy of
-      # the config. Binding a path that does not exist is not a no-op —
-      # docker creates an empty directory in its place and searxng
-      # crash-loops on
-      #   "/etc/searxng/settings.yml" is not a valid file, exiting...
-      # because it cannot write its default template into a read-only
-      # mount. Populate the directory once per host (see README step 4);
-      # the config is load-bearing besides, enabling the json output
-      # format that brain's search_web needs.
-      - ${SEARXNG_CONFIG_DIR:-/data/coolify/timothy/searxng}:/etc/searxng:ro
+    # An inline config, not a bind: Coolify rewrites relative bind
+    # sources into its own application data directory rather than the git
+    # checkout, so neither ./searxng nor ../searxng reaches this repo's
+    # copy. Binding a path that does not exist is not a no-op — docker
+    # creates an empty directory in its place and searxng crash-loops on
+    #   "/etc/searxng/settings.yml" is not a valid file, exiting...
+    # because it cannot write its default template into the mount. An
+    # inline config needs no host path and no operator step. Keep the
+    # content below in sync with deploy/searxng/settings.yml, the copy
+    # the release workflow ships; the json output format it enables is
+    # what brain's search_web needs, stock searxng serves HTML only.
+    configs:
+      - source: searxng_settings
+        target: /etc/searxng/settings.yml
     # internal-only: no published ports; brain is the sole caller
 
   markitdown:
@@ -266,6 +266,28 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+configs:
+  searxng_settings:
+    content: |
+      use_default_settings: true
+
+      general:
+        # No telemetry to the SearXNG project; this instance serves one tool.
+        enable_metrics: false
+
+      search:
+        formats:
+          - html
+          - json
+
+      server:
+        # No published port and a single internal caller (brain): this key
+        # only signs session cookies nothing outside the compose network can
+        # reach, so a static value is fine here.
+        secret_key: "3db45963595b11ba5641234fb40bfb84c612b7aaf25ceff7cc496355337e1add"
+        limiter: false
+
 
 volumes:
   pgdata:
