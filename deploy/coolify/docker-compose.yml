@@ -63,9 +63,13 @@ services:
     volumes:
       # ../searxng, not ./searxng: Coolify's --project-directory is this
       # folder, and the config's single source of truth lives one level
-      # up at deploy/searxng/settings.yml. It is load-bearing — it
-      # enables the json output format that brain's search_web needs;
-      # stock searxng serves HTML only and would answer 403.
+      # up at deploy/searxng/settings.yml. Binding a path that does not
+      # exist is not a no-op — docker creates an empty directory in its
+      # place, and searxng then crash-loops on
+      #   "/etc/searxng/settings.yml" is not a valid file, exiting...
+      # because it cannot write its default template into a mount this
+      # file declares read-only. The config is load-bearing besides: it
+      # enables the json output format that brain's search_web needs.
       - ../searxng:/etc/searxng:ro
     # internal-only: no published ports; brain is the sole caller
 
