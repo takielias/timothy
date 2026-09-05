@@ -1,15 +1,15 @@
 # Coolify deployment (Docker Compose resource, Git source).
 #
 # Set Base Directory to /deploy/coolify and Compose file to
-# docker-compose.yml. Coolify passes --project-directory pointing at
-# this folder, which is why the searxng bind below is ../searxng: the
-# config has exactly one copy, at deploy/searxng/settings.yml, and the
-# release workflow ships that same file as a release asset.
+# docker-compose.yml. Coolify rewrites relative bind sources into its own
+# application data directory rather than the git checkout, so the searxng
+# config below is bound from an absolute host path the operator populates
+# once from deploy/searxng/settings.yml — see README step 4.
 #
 # Deltas from deploy/release/docker-compose.yml (which targets a flat
 # install directory, not a repo checkout):
 #   - no top-level `name:` — Coolify sets --project-name itself
-#   - searxng config bound from ../searxng instead of ./searxng
+#   - searxng config bound from an absolute host path, not ./searxng
 #   - no published host ports; Coolify's proxy terminates TLS and
 #     routes to `web`, and web's nginx proxies /v1 to brain same-origin
 #
@@ -61,16 +61,19 @@ services:
     environment:
       SEARXNG_BASE_URL: http://searxng:8080/
     volumes:
-      # ../searxng, not ./searxng: Coolify's --project-directory is this
-      # folder, and the config's single source of truth lives one level
-      # up at deploy/searxng/settings.yml. Binding a path that does not
-      # exist is not a no-op — docker creates an empty directory in its
-      # place, and searxng then crash-loops on
+      # An absolute host path, not a repo-relative one: Coolify rewrites
+      # relative bind sources into its own application data directory
+      # (/data/coolify/applications/<uuid>), not the git checkout, so
+      # neither ./searxng nor ../searxng ever reaches this repo's copy of
+      # the config. Binding a path that does not exist is not a no-op —
+      # docker creates an empty directory in its place and searxng
+      # crash-loops on
       #   "/etc/searxng/settings.yml" is not a valid file, exiting...
-      # because it cannot write its default template into a mount this
-      # file declares read-only. The config is load-bearing besides: it
-      # enables the json output format that brain's search_web needs.
-      - ../searxng:/etc/searxng:ro
+      # because it cannot write its default template into a read-only
+      # mount. Populate the directory once per host (see README step 4);
+      # the config is load-bearing besides, enabling the json output
+      # format that brain's search_web needs.
+      - ${SEARXNG_CONFIG_DIR:-/data/coolify/timothy/searxng}:/etc/searxng:ro
     # internal-only: no published ports; brain is the sole caller
 
   markitdown:
