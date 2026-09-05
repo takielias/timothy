@@ -47,8 +47,11 @@ authorized redirect URIs. A wrong value fails connectors with no obvious
 error.
 
 `DOCKER_SOCK_GID` defaults to `0`, which is Docker Desktop's socket
-group. A Linux host is rarely `0`, and a wrong value leaves `sandboxd`
-unable to start mission containers.
+group; on Ubuntu it is typically `988`. A wrong value is fatal rather than
+degraded — `sandboxd` fails closed, logs `permission denied while trying to
+connect to the docker API at unix:///var/run/docker.sock`, exits 1, and takes
+the whole deployment down with it. The symptom is a 502 from the proxy, since
+Coolify stops the other containers too.
 
 **Back up `TIMOTHY_MASTER_KEY` somewhere outside Coolify.** On a Compose
 install it lives in `.env` next to the data; here it lives in Coolify's
