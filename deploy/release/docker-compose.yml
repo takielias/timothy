@@ -45,8 +45,14 @@ services:
     image: searxng/searxng@sha256:aaf56bb5ad737d48a8a375778d42eb4ab1757231e6b1eb7980e71d8dd5bdf0de
     environment:
       SEARXNG_BASE_URL: http://searxng:8080/
-    volumes:
-      - ./searxng:/etc/searxng:ro
+    # TEST BRANCH: configs instead of a bind, to find out whether Coolify
+    # rewrites `configs.file` sources the way it rewrites relative bind
+    # mount sources (into its own application data directory, not the git
+    # checkout). A file-only mount also leaves /etc/searxng writable, so
+    # searxng stops logging "cp: ... Read-only file system" at startup.
+    configs:
+      - source: searxng_settings
+        target: /etc/searxng/settings.yml
     # internal-only: no published ports; brain is the sole caller
 
   markitdown:
@@ -236,6 +242,13 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+configs:
+  searxng_settings:
+    # Relative to the project directory (this file's directory): the
+    # searxng/settings.yml the installer downloads next to the compose
+    # file, and the same path in a git checkout of deploy/release.
+    file: ./searxng/settings.yml
 
 volumes:
   pgdata:
