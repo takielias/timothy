@@ -166,6 +166,11 @@ type delegatedRunner struct {
 	lastRun      lastRunStateFunc
 	ledger       usageRecorder
 
+	// progressReader backs mid-run steering delivery to a Steerer
+	// adapter's run (issue #358): mirrors nativeRunner.progressReader,
+	// unset means the feature is off, same nil-safe contract.
+	progressReader ProgressReader
+
 	log *slog.Logger
 
 	// Overridable in tests so scenarios don't wait real minutes.
@@ -195,6 +200,14 @@ func NewDelegatedRunner(native Runner, resolveRoute routeResolver, resolveCred c
 		routeResolveBackoff: routeResolveBackoffMin,
 		cooldown:            map[cooldownKey]time.Time{},
 	}
+}
+
+// SetProgressReader wires the reader pollToVerdict polls for mid-run
+// operator notes to deliver to a Steerer adapter's run (issue #358):
+// same setter pattern as nativeRunner.SetProgressReader, so
+// cmd/brain/main.go can pass the same *Store both runners share.
+func (r *delegatedRunner) SetProgressReader(pr ProgressReader) {
+	r.progressReader = pr
 }
 
 // effectiveRunBudget is the wall-clock cap for a launch happening now.
@@ -559,10 +572,26 @@ func (r *delegatedRunner) runDelegated(ctx context.Context, m Mission, packet Wo
 		r.coolDown(m.Harness, entry)
 		return WorkerVerdict{}, "", fmt.Errorf("delegated runner: write invocation files: %w", err)
 	}
+	// issue #358: a Steerer adapter (pi) takes its prompt and any
+	// mid-run steering on stdin rather than argv - prompt.jsonl seeds
+	// the run's stdin, steer.jsonl starts empty and pollToVerdict
+	// appends a line to it for every fresh operator note while the run
+	// is alive (see buildLaunchCmd's stdin mode).
+	if steerer, ok := adapter.(executor.Steerer); ok {
+		if err := os.WriteFile(filepath.Join(rdir, "prompt.jsonl"), []byte(steerer.PromptCommand(user)+"\n"), 0o600); err != nil {
+			r.coolDown(m.Harness, entry)
+			return WorkerVerdict{}, "", fmt.Errorf("delegated runner: write prompt.jsonl: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join(rdir, "steer.jsonl"), nil, 0o600); err != nil {
+			r.coolDown(m.Harness, entry)
+			return WorkerVerdict{}, "", fmt.Errorf("delegated runner: create steer.jsonl: %w", err)
+		}
+	}
 
 	r.recordSpawned(ctx, m.ID, m.Harness, entry, runID, rdir, authMode, decision)
 
-	if err := r.launch(ctx, m.ID, m.Environment, workRoot, rdir, inv, runBudget); err != nil {
+	_, isSteerer := adapter.(executor.Steerer)
+	if err := r.launch(ctx, m.ID, m.Environment, workRoot, rdir, inv, runBudget, isSteerer); err != nil {
 		r.coolDown(m.Harness, entry)
 		r.recordDied(ctx, m.ID, "spawn_failed", nil, err.Error())
 		return WorkerVerdict{}, "", fmt.Errorf("delegated runner: launch: %w", err)
@@ -659,9 +688,11 @@ func (r *delegatedRunner) planSessionResume(ctx context.Context, m Mission, work
 // redirected into the run directory. The `timeout` wrapper (D-052)
 // enforces spec.RunBudget itself, independent of anything brain does
 // afterward — a crashed brain still lets the container kill a runaway
-// CLI.
-func (r *delegatedRunner) launch(ctx context.Context, missionID, environment, workdir, rdir string, inv executor.Invocation, runBudget time.Duration) error {
-	launchCmd, err := buildLaunchCmd(workdir, rdir, inv, runBudget)
+// CLI. stdinMode is true for a Steerer adapter (issue #358): the CLI's
+// stdin stays open for the run's life via `tail -f steer.jsonl` so a
+// later mid-run steer command can still reach it.
+func (r *delegatedRunner) launch(ctx context.Context, missionID, environment, workdir, rdir string, inv executor.Invocation, runBudget time.Duration, stdinMode bool) error {
+	launchCmd, err := buildLaunchCmd(workdir, rdir, inv, runBudget, stdinMode)
 	if err != nil {
 		return err
 	}
@@ -694,16 +725,35 @@ const containerMarkerFile = ".timothy-container-marker"
 // script is quoted as ONE unit via shQuote — composing it with literal
 // quotes would let the argv elements' own single quotes toggle the
 // outer quoting and word-split any argument containing spaces (the
-// system-prompt append, most obviously).
-func buildLaunchCmd(workdir, rdir string, inv executor.Invocation, runBudget time.Duration) (string, error) {
+// system-prompt append, most obviously). stdinMode (issue #358) feeds
+// the CLI's stdin from prompt.jsonl followed by `tail -f steer.jsonl`
+// instead of the plain argv-only invocation: `tail -f` keeps stdin open
+// for the run's life, so a later append to steer.jsonl (pollToVerdict's
+// steering injection) still reaches the running process; killRun's
+// existing TERM/KILL path ends the process (and its stdin pipe) exactly
+// as it does today.
+func buildLaunchCmd(workdir, rdir string, inv executor.Invocation, runBudget time.Duration, stdinMode bool) (string, error) {
 	argv, err := renderArgv(inv)
 	if err != nil {
 		return "", err
 	}
-	inner := fmt.Sprintf(
-		"timeout -k 30 %d %s > %s/run.ndjson 2> %s/stderr.log; echo $? > %s/exit_code",
-		int(runBudget/time.Second), argv, shQuote(rdir), shQuote(rdir), shQuote(rdir),
-	)
+	var inner string
+	if stdinMode {
+		// The feeder (prompt line, then tail -f steer.jsonl) writes into a
+		// fifo the CLI reads as stdin; its pid lands in stdin.pid so
+		// closeStdin can end the feed once the run's result has arrived,
+		// which gives the CLI EOF and lets it exit on its own. exec keeps
+		// tail's pid equal to the recorded one.
+		inner = fmt.Sprintf(
+			"rm -f %[1]s/stdin.fifo && mkfifo %[1]s/stdin.fifo && { ( cat %[1]s/prompt.jsonl; exec tail -f %[1]s/steer.jsonl ) > %[1]s/stdin.fifo & echo $! > %[1]s/stdin.pid; }; timeout -k 30 %[2]d %[3]s < %[1]s/stdin.fifo > %[1]s/run.ndjson 2> %[1]s/stderr.log; echo $? > %[1]s/exit_code; kill \"$(cat %[1]s/stdin.pid)\" 2>/dev/null",
+			shQuote(rdir), int(runBudget/time.Second), argv,
+		)
+	} else {
+		inner = fmt.Sprintf(
+			"timeout -k 30 %d %s > %s/run.ndjson 2> %s/stderr.log; echo $? > %s/exit_code",
+			int(runBudget/time.Second), argv, shQuote(rdir), shQuote(rdir), shQuote(rdir),
+		)
+	}
 	// Braces bound the `&` to the setsid job alone — a bare `cd && mkdir
 	// && setsid ... & echo $!` backgrounds the whole chain and races the
 	// pid write against the mkdir it depends on. The marker write runs
@@ -766,6 +816,9 @@ type pollState struct {
 	toolCalls    int
 	sawResult    bool
 	resultEvent  executor.Event
+	// stdinClosed marks that closeStdin already ended a Steerer run's
+	// stdin feed after its result arrived (issue #358).
+	stdinClosed bool
 	// reportedModel is the model the harness itself said it ran, from
 	// its KindSystem init line. Preferred over the route entry's model
 	// when recording usage: a self-paired harness's provider row carries
@@ -796,6 +849,18 @@ func (r *delegatedRunner) pollToVerdict(ctx context.Context, m Mission, workRoot
 	st := &pollState{offset: startOffset, lastByteMove: time.Now(), lastProgress: time.Now()}
 	start := time.Now()
 
+	// Mid-run steering (issue #358) applies only to a Steerer adapter
+	// (pi's rpc mode) with a progress reader wired; steerer stays nil
+	// otherwise and the injection below is skipped. The watermark starts
+	// past the operator notes already rendered into this turn's packet
+	// (same seed as nativeRunner.steeringFor), so a note from an earlier
+	// turn is never redelivered as fresh steering.
+	var steerer executor.Steerer
+	if s, ok := adapter.(executor.Steerer); ok && r.progressReader != nil {
+		steerer = s
+	}
+	steerWatermark := countOperatorNotes(m.Progress)
+
 	ticker := time.NewTicker(r.pollInterval)
 	defer ticker.Stop()
 
@@ -823,11 +888,30 @@ func (r *delegatedRunner) pollToVerdict(ctx context.Context, m Mission, workRoot
 			st.worktree = worktree
 		}
 
+		// Steer injection runs BEFORE this poll's own terminal checks: a
+		// run already alive (before we know from this same poll whether
+		// it just finished) and never having produced a result yet is the
+		// only safe window - pi exits 0 on stdin EOF, and a steer command
+		// arriving after agent_end starts a whole NEW agent run instead of
+		// queuing onto the current one (verified against pi 0.84.1),
+		// so injection must stop the instant a terminal event was parsed.
+		if steerer != nil && alive && !st.sawResult {
+			steerWatermark = r.injectSteering(ctx, m, workRoot, rdir, steerer, steerWatermark)
+		}
+
 		if len(chunk) > 0 {
 			st.offset += int64(len(chunk))
 			st.lastByteMove = time.Now()
 			r.feedLines(ctx, parser, chunk, st, m.ID, runID)
 			r.recordProgressThrottled(ctx, m.ID, runID, st)
+		}
+
+		// A Steerer run never exits on its own: its stdin feed holds the
+		// CLI open (issue #358). Once the result has arrived, end the feed
+		// so the CLI sees EOF, exits, and the next poll finishes normally.
+		if steerer != nil && st.sawResult && alive && !hasExit && !st.stdinClosed {
+			r.closeStdin(ctx, m, workRoot, rdir)
+			st.stdinClosed = true
 		}
 
 		if st.sawResult && hasExit {
@@ -851,6 +935,52 @@ func (r *delegatedRunner) pollToVerdict(ctx context.Context, m Mission, workRoot
 			return forcedRetryVerdict("the executor produced no output for the idle timeout and was killed"), st.textBuf.String(), nil
 		}
 	}
+}
+
+// closeStdin ends a Steerer run's stdin feed by killing the recorded
+// feeder pid (issue #358): the fifo's write side closes, the CLI reads
+// EOF and exits, and the run finishes through the regular exit path.
+// Best effort: a failure logs and leaves the idle timeout as the
+// fallback.
+func (r *delegatedRunner) closeStdin(ctx context.Context, m Mission, workRoot, rdir string) {
+	cmd := fmt.Sprintf("kill \"$(cat %s/stdin.pid)\" 2>/dev/null", shQuote(rdir))
+	var out bytes.Buffer
+	if code, err := r.sandboxExec(ctx, m.ID, m.Environment, workRoot, cmd, nil, launchTimeout, &out); err != nil || code != 0 {
+		r.log.Warn("delegated runner: close stdin failed", "mission_id", m.ID, "error", err, "exit_code", code)
+	}
+}
+
+// injectSteering delivers every fresh operator note (past watermark) to
+// a Steerer adapter's in-flight run by appending one SteerCommand line
+// per note to rdir/steer.jsonl, and records an executor.steered event
+// for each (issue #358). Returns the advanced watermark; on a failed
+// poll or append, returns watermark unchanged (never advanced past what
+// was actually delivered) and logs a warning - steering is a best-
+// effort mid-run nicety, same stance as nativeRunner.steeringFor, so a
+// failure here never fails the run.
+func (r *delegatedRunner) injectSteering(ctx context.Context, m Mission, workRoot, rdir string, steerer executor.Steerer, watermark int) int {
+	notes, err := r.progressReader.Progress(ctx, m.ID)
+	if err != nil {
+		r.log.Warn("delegated runner: poll steering notes failed", "mission_id", m.ID, "error", err)
+		return watermark
+	}
+	fresh, newWatermark := freshOperatorNotes(notes, watermark)
+	delivered := watermark
+	for _, note := range fresh {
+		line := steerer.SteerCommand("Operator steering note (mid-run): " + note)
+		cmd := fmt.Sprintf("printf '%%s\\n' %s >> %s/steer.jsonl", shQuote(line), shQuote(rdir))
+		var out bytes.Buffer
+		if code, err := r.sandboxExec(ctx, m.ID, m.Environment, workRoot, cmd, nil, launchTimeout, &out); err != nil || code != 0 {
+			// Only the notes actually appended so far count toward the
+			// watermark - a note that failed to append must be retried on
+			// the next poll, never skipped.
+			r.log.Warn("delegated runner: steer append failed", "mission_id", m.ID, "error", err, "exit_code", code)
+			return delivered
+		}
+		delivered++
+		r.recordEventForce(ctx, m.ID, "executor.steered", map[string]any{"note": note, "harness": m.Harness})
+	}
+	return newWatermark
 }
 
 // pollBoundaryPrefix + runID makes the boundary marker printf'd between
