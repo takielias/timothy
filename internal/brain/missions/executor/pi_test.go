@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -260,6 +261,152 @@ func TestPiParser_AgentEndWillRetryIsNoise(t *testing.T) {
 	}
 }
 
+// TestPiParser_RPCModeIgnoresResponseAndQueueUpdate pins that rpc
+// mode's extra line types (issue #358) never surface as events, while
+// the rest of the stream (tool activity, terminal result) still parses
+// exactly as it does in json mode.
+func TestPiParser_RPCModeIgnoresResponseAndQueueUpdate(t *testing.T) {
+	lines := loadPiFixture(t, "rpc.ndjson")
+	p := piAdapter{}.NewParser()
+
+	want := []eventSummary{
+		{kind: KindSystem, textHead: "/w"},
+		{kind: KindTool, toolName: "write", status: "started"},
+		{kind: KindTool, toolName: "write", status: "finished"},
+		{kind: KindText, textHead: "{\"status\":\"DONE\",\"no"},
+		{kind: KindResult, textHead: "{\"status\":\"DONE\",\"no"},
+	}
+
+	var got []eventSummary
+	var resultCount int
+	for _, line := range lines {
+		ev, ok := p.ParseLine(line)
+		if !ok {
+			continue
+		}
+		got = append(got, summarize(ev))
+		if ev.Kind == KindResult {
+			resultCount++
+		}
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("event count = %d, want %d\ngot: %+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("event[%d] = %+v, want %+v", i, got[i], w)
+		}
+	}
+	if resultCount != 1 {
+		t.Fatalf("KindResult count = %d, want exactly 1", resultCount)
+	}
+
+	stats := p.(ParserStats).Stats()
+	if stats.Unknown != len(lines)-len(want) {
+		t.Errorf("stats.Unknown = %d, want %d", stats.Unknown, len(lines)-len(want))
+	}
+}
+
+// TestPiParser_ReviewVerdictLine covers issue #582: a run whose final
+// message ends with a review_verdict-shaped JSON line lands that line
+// on Event.Result verbatim (the missions package decodes it), while
+// ParseResult, which only knows DONE/RETRY/BLOCKED, reports ok=false.
+func TestPiParser_ReviewVerdictLine(t *testing.T) {
+	tests := []struct {
+		fixture      string
+		wantDecision string
+		wantFindings int
+	}{
+		{"review-approve.ndjson", "approve", 0},
+		{"review-rework.ndjson", "rework", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.fixture, func(t *testing.T) {
+			p := piAdapter{}.NewParser()
+			var result Event
+			var results int
+			for _, line := range loadPiFixture(t, tt.fixture) {
+				ev, ok := p.ParseLine(line)
+				if ok && ev.Kind == KindResult {
+					results++
+					result = ev
+				}
+			}
+			if results != 1 {
+				t.Fatalf("KindResult count = %d, want exactly 1", results)
+			}
+			if result.Result == nil {
+				t.Fatalf("Result = nil, want the trailing verdict line; text was %q", result.Text)
+			}
+			var v struct {
+				Decision string           `json:"decision"`
+				Findings []map[string]any `json:"findings"`
+			}
+			if err := json.Unmarshal(result.Result, &v); err != nil {
+				t.Fatalf("Result does not decode: %v", err)
+			}
+			if v.Decision != tt.wantDecision || len(v.Findings) != tt.wantFindings {
+				t.Errorf("decision/findings = %q/%d, want %q/%d", v.Decision, len(v.Findings), tt.wantDecision, tt.wantFindings)
+			}
+			if _, ok := (piAdapter{}).ParseResult(result); ok {
+				t.Error("ParseResult accepted a review verdict as a worker status")
+			}
+		})
+	}
+}
+
+// TestPiAdapter_ImplementsSteerer pins that piAdapter satisfies
+// executor.Steerer (issue #358): the delegated runner type-asserts
+// adapters against this interface to decide whether mid-run steering
+// is even possible for a harness.
+func TestPiAdapter_ImplementsSteerer(t *testing.T) {
+	var _ Steerer = piAdapter{}
+}
+
+func TestPiAdapter_PromptCommand(t *testing.T) {
+	a := piAdapter{}
+	got := a.PromptCommand("do the thing")
+	want := `{"type":"prompt","message":"do the thing"}`
+	if got != want {
+		t.Errorf("PromptCommand = %s, want %s", got, want)
+	}
+}
+
+func TestPiAdapter_SteerCommand(t *testing.T) {
+	a := piAdapter{}
+	got := a.SteerCommand("focus on staging next")
+	want := `{"type":"steer","message":"focus on staging next"}`
+	if got != want {
+		t.Errorf("SteerCommand = %s, want %s", got, want)
+	}
+}
+
+// TestPiAdapter_CommandsEscapeQuotesAndNewlines pins that
+// PromptCommand/SteerCommand run their message through json.Marshal,
+// not string concatenation - a note carrying quotes or newlines (an
+// operator steering note is free text) must still produce one valid
+// JSON line.
+func TestPiAdapter_CommandsEscapeQuotesAndNewlines(t *testing.T) {
+	a := piAdapter{}
+	note := "she said \"hurry up\"\nand then left"
+	for _, cmd := range []string{a.PromptCommand(note), a.SteerCommand(note)} {
+		var decoded struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(cmd), &decoded); err != nil {
+			t.Fatalf("command %q does not decode as JSON: %v", cmd, err)
+		}
+		if decoded.Message != note {
+			t.Errorf("decoded message = %q, want %q", decoded.Message, note)
+		}
+		if strings.Contains(cmd, "\n") {
+			t.Errorf("command %q must be a single line, embedded newline must be escaped", cmd)
+		}
+	}
+}
+
 func TestPiAdapter_BuildInvocation(t *testing.T) {
 	a := piAdapter{}
 
@@ -372,6 +519,46 @@ func TestPiAdapter_BuildInvocation(t *testing.T) {
 			},
 		},
 		{
+			name: "read-only narrows --tools to the read-only list (issue #582)",
+			spec: InvocationSpec{
+				Model: "sonnet", PromptPath: "/tmp/run/prompt.md",
+				AuthMode: AuthAPIKey, APIKey: "sk-test", Wire: "anthropic",
+				ReadOnly: true,
+			},
+			check: func(t *testing.T, inv Invocation) {
+				if !containsFlagValue(inv.Argv, "--tools", piReadOnlyTools) {
+					t.Errorf("argv %v missing --tools %s", inv.Argv, piReadOnlyTools)
+				}
+				for _, a := range inv.Argv {
+					if strings.Contains(a, "bash") || strings.Contains(a, "edit") || strings.Contains(a, "write") {
+						t.Errorf("read-only argv element %q still names a writing tool", a)
+					}
+				}
+			},
+		},
+		{
+			name: "result schema swaps the sentinel for the schema-aware instruction (issue #582)",
+			spec: InvocationSpec{
+				Model: "sonnet", PromptPath: "/tmp/run/prompt.md",
+				AuthMode: AuthAPIKey, APIKey: "sk-test", Wire: "anthropic",
+				SystemAppend: "judge it",
+				ResultSchema: json.RawMessage(`{"type": "object", "properties": {"decision": {"type": "string"}}}`),
+			},
+			check: func(t *testing.T, inv Invocation) {
+				idx := flagIndex(inv.Argv, "--append-system-prompt")
+				if idx == -1 {
+					t.Fatalf("argv %v missing --append-system-prompt", inv.Argv)
+				}
+				want := "judge it" + piSchemaInstruction + `{"properties":{"decision":{"type":"string"}},"type":"object"}`
+				if got := inv.Argv[idx+1]; got != want {
+					t.Errorf("system append = %q, want %q", got, want)
+				}
+				if strings.Contains(inv.Argv[idx+1], "DONE") {
+					t.Error("schema-aware instruction must not mention the DONE/RETRY/BLOCKED sentinel")
+				}
+			},
+		},
+		{
 			name: "argv exact",
 			spec: InvocationSpec{
 				Model: "sonnet", PromptPath: "/tmp/run/prompt.md",
@@ -381,7 +568,7 @@ func TestPiAdapter_BuildInvocation(t *testing.T) {
 			check: func(t *testing.T, inv Invocation) {
 				want := []string{
 					"pi",
-					"--mode", "json",
+					"--mode", "rpc",
 					"--no-extensions",
 					"--no-skills",
 					"--no-prompt-templates",
@@ -392,7 +579,6 @@ func TestPiAdapter_BuildInvocation(t *testing.T) {
 					"--tools", "read,bash,edit,write,grep,find,ls",
 					"--model", "timothy/sonnet",
 					"--append-system-prompt", "be nice" + piVerdictInstruction,
-					"@PROMPT@",
 				}
 				if len(inv.Argv) != len(want) {
 					t.Fatalf("argv = %v, want %v", inv.Argv, want)
@@ -401,6 +587,14 @@ func TestPiAdapter_BuildInvocation(t *testing.T) {
 					if inv.Argv[i] != want[i] {
 						t.Errorf("argv[%d] = %q, want %q", i, inv.Argv[i], want[i])
 					}
+				}
+				for _, a := range inv.Argv {
+					if a == "@PROMPT@" {
+						t.Fatal("rpc mode must not carry @PROMPT@ on argv, the prompt rides stdin")
+					}
+				}
+				if inv.PromptFile == "" {
+					t.Error("PromptFile must still be set so the runner writes prompt.md for the run dir record")
 				}
 			},
 		},

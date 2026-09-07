@@ -104,10 +104,11 @@ First run: `cp deploy/env.example deploy/.env` and set
   rows safely before the data migration in `scripts/pending-alters.md`
   runs; historical `mission_events` payloads keep their old phase
   names forever, tolerated by the web timeline renderer. Result is
-  deterministic harness code (zero LLM turns): destinations delivery,
-  artifact copy, KB promotion, and `on_complete` push/PR all run there
-  now, not on the old done transition; a failure parks the mission IN
-  result with a visible pause reason instead of being lost.
+  deterministic harness code (zero LLM turns): destinations delivery
+  (including github push/PR, issue #561), artifact copy, and KB
+  promotion all run there now, not on the old done transition; a
+  failure parks the mission IN result with a visible pause reason
+  instead of being lost.
 - Light missions (D-069, kind=general only): born in phase=generate,
   skip discover/plan/prove; the deliverable travels in mission_status's
   `final_output` argument (reasoning models emit tool calls with no
@@ -127,10 +128,14 @@ First run: `cp deploy/env.example deploy/.env` and set
   at create and rendered into discover/plan/work prompts. Worktree bases
   on the parent branch when reachable, else the repo default. Never
   reopen a terminal mission.
-- PDF attachments: converted via markitdown ONCE at create (prompt-
-  cache stability), markdown stored in the `attachments` jsonb column,
-  rendered neutralized into every prompt; capped at 8; API responses
-  strip the markdown. Images/audio unsupported.
+- Mission attachments (issue #359): PDF/text converted via markitdown,
+  images captioned via the vision route (`chat.CaptionImageOverGateway`),
+  audio transcribed via the whisper sidecar, all ONCE at create (prompt-
+  cache stability), stored on the mission's `sources` jsonb column,
+  rendered neutralized into every prompt labeled by mime (document/
+  image/audio); capped at 8; API responses strip the markdown. Schedule
+  templates carry the same attachments, resolved once at schedule
+  create/patch time so a fire never re-converts.
 - PDF export: POST /v1/missions/{id}/export-pdf renders workspace
   markdown (single file, or all files merged book-style) through
   `internal/brain/pdfgen`, which caches by content hash in
@@ -188,6 +193,11 @@ First run: `cp deploy/env.example deploy/.env` and set
   and park the turn.
 - Non-coding units whose artifacts + verify_cmd pass harness checks skip
   LLM review entirely (`mission.review_skipped`).
+- Delegated reviewer (issue #582): a mission's opt-in `review_harness`
+  runs the prove round as a read-only CLI (`executor.InvocationSpec.
+  ReadOnly`, enforced per adapter in Go) in the sandbox/worktree with
+  the rendered review packet as prompt; native review is the floor,
+  every failure records `review.delegated_fallback` and runs it.
 - `make canary` is the regression gate for any harness change.
 
 ## Key invariants (enforce, never relax)

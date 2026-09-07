@@ -4,12 +4,9 @@ import { toast } from 'sonner'
 import {
   classifyMission,
   type CreateMissionInput,
-  createConnectorRepo,
   createMission,
   createSchedule,
-  detectMissionDestination,
   type ExecutorOption,
-  type GitHubDestinationDetection,
   getMissionExecutionPlan,
   getMissionExecutorOptions,
   getSettings,
@@ -18,7 +15,6 @@ import {
   listDestinations,
   listKbCollections,
   patchSchedule,
-  testConnector,
 } from '../../api/client'
 import type {
   AdminAgent,
@@ -26,7 +22,6 @@ import type {
   AdminRoute,
   Destination,
   ExecutionPlanPhase,
-  GitHubIdentity,
   GitHubRepo,
   KbCollection,
   Reference,
@@ -36,12 +31,7 @@ import { useAgents, useRoutes } from '../AgentPicker'
 import { slugify } from '../settings/AgentForm'
 import { cronPresets, type CronPresetValue, presetFor } from '../../lib/schedules'
 import { CURRENCIES } from '../../lib/currencies'
-import {
-  COMMIT_STYLE_DEFAULT,
-  ON_COMPLETE_NONE,
-  commitStyleChoices,
-  onCompleteChoices,
-} from '../../lib/githubDestination'
+import { extractRepoMentions, matchRepo } from '../../lib/goalRepo'
 import { Badge } from '../ui/badge'
 import { Button } from '../ui/button'
 import { Calendar } from '../ui/calendar'
@@ -63,8 +53,6 @@ import { MissionExecutionPlan } from './MissionExecutionPlan'
 type RepoSource = 'none' | 'github'
 
 type Kind = 'coding' | 'general'
-
-type OnComplete = '' | 'push' | 'push_pr'
 
 // Flow selects the phase set a mission runs (D-090, issue #459); only
 // meaningful on kind=general (coding always stays 'full', enforced
@@ -120,9 +108,8 @@ function hasNonDefaults(t: Schedule['mission_template']): boolean {
     t.review_route ||
     t.plan_route ||
     t.harness ||
-    t.environment ||
-    t.branch_pattern ||
-    t.commit_style
+    t.review_harness ||
+    t.environment
   )
 }
 
@@ -187,6 +174,15 @@ export const executorChoices: { value: string; label: string }[] = [
   { value: 'codex-cli', label: 'Codex CLI' },
   { value: 'opencode', label: 'OpenCode' },
   { value: 'cursor-cli', label: 'Cursor CLI' },
+]
+
+// reviewHarnessChoices is the Review harness select's list (issue #582):
+// Native (the default, wire value '') plus the registered adapters.
+// cursor-cli and opencode have no read-only mode, so picking them would
+// only ever fall back to native; they are left out.
+export const reviewHarnessChoices: { value: string; label: string }[] = [
+  { value: EXECUTOR_DEFAULT, label: 'Native' },
+  ...executorChoices.filter((c) => ['claude-cli', 'pi', 'codex-cli'].includes(c.value)),
 ]
 
 // defaultHarnessLabel names what the Harness select's "Default" choice
@@ -259,6 +255,11 @@ function looksLikeLightGoal(goal: string): boolean {
   return lightSignalPattern.test(trimmed)
 }
 
+// pushSignalPattern matches goal text that talks about pushing or
+// opening a pull/merge request (issue #563): the destination-suggestion
+// hint, never auto-checked.
+const pushSignalPattern = /\b(push|pull request|pr|merge request)\b/i
+
 // expiresAt is stored as the wire-compatible 'YYYY-MM-DDTHH:mm' string the
 // API already expects; these split it into a Date (for the calendar) and a
 // 'HH:mm' string (for the time input) and back.
@@ -327,9 +328,11 @@ export function MissionForm({
     () => (goal.trim() === '' ? 0 : goal.trim().split(/\s+/).length),
     [goal],
   )
-  // attachments, like goal, is never seeded from initial: a follow-up
-  // carries the parent's outcome digest as prompt context, not its
-  // documents; each new mission attaches its own.
+  // attachments, like goal, is never seeded from a follow-up's initial:
+  // a follow-up carries the parent's outcome digest as prompt context,
+  // not its documents; each new mission attaches its own. Edit mode
+  // seeds it from the schedule's own stored template attachments
+  // (issue #359, see the schedule-load effect below).
   const [attachments, setAttachments] = useState<PendingAttachment[]>([])
   // references picked via the goal field's # mentions: component
   // state only, resolved server-side at create time.
@@ -366,7 +369,7 @@ export function MissionForm({
   // schedule (repeat on), and editing an existing schedule: fetched
   // once per form regardless of mode.
   const [destinations, setDestinations] = useState<Destination[] | null>(null)
-  const [destinationIDs, setDestinationIDs] = useState<string[]>([])
+  const [destinationIDs, setDestinationIDs] = useState<string[]>(initial?.destination_ids ?? [])
   useEffect(() => {
     listDestinations()
       .then(setDestinations)
@@ -401,9 +404,8 @@ export function MissionForm({
   const [autoApproveTools, setAutoApproveTools] = useState(true)
   const [autoApprovePlan, setAutoApprovePlan] = useState(true)
   const [harness, setHarness] = useState(initial?.harness ?? '')
+  const [reviewHarness, setReviewHarness] = useState(initial?.review_harness ?? '')
   const [environment, setEnvironment] = useState(initial?.environment ?? '')
-  const [branchPattern, setBranchPattern] = useState(initial?.branch_pattern ?? '')
-  const [commitStyle, setCommitStyle] = useState(initial?.commit_style ?? '')
   const [executorOptions, setExecutorOptions] = useState<ExecutorOption[] | null>(null)
   const [executionPlan, setExecutionPlan] = useState<ExecutionPlanPhase[] | null>(null)
   // defaultHarnessName is settings' coding_executor value (the harness
@@ -416,7 +418,7 @@ export function MissionForm({
 
   // Repository source: 'none' self-initializes an empty repo (the
   // existing coding-mission default); 'github' clones an existing repo
-  // (or a brand-new one) through a github-kind connector.
+  // through a github-kind connector.
   const [repoSource, setRepoSource] = useState<RepoSource>(initial?.repo_url ? 'github' : 'none')
   const [githubConnectors, setGithubConnectors] = useState<AdminConnector[] | null>(null)
   const [connectorID, setConnectorID] = useState(initial?.connector_id ?? '')
@@ -427,16 +429,31 @@ export function MissionForm({
   const [selectedRepo, setSelectedRepo] = useState<GitHubRepo | null>(
     initial?.repo_url ? repoFromCloneURL(initial.repo_url) : null,
   )
-  const [connIdentity, setConnIdentity] = useState<GitHubIdentity | null>(null)
   const [repoPickerOpen, setRepoPickerOpen] = useState(false)
-  const [newRepo, setNewRepo] = useState(false)
-  const [newRepoName, setNewRepoName] = useState('')
-  const [newRepoPrivate, setNewRepoPrivate] = useState(true)
+
+  // sourceProposed (issue #563) marks a repo source this form set from
+  // the goal text rather than the operator's own pick: gates whether a
+  // later proposal is still allowed to override it (a hand-picked
+  // source, sourceProposed=false, is never touched again).
+  const [sourceProposed, setSourceProposed] = useState(false)
+  const [proposalNote, setProposalNote] = useState<string | null>(null)
+  const [proposalCandidates, setProposalCandidates] = useState<{
+    connectorID: string
+    repos: GitHubRepo[]
+  } | null>(null)
+  // clearedForGoal remembers the goal text a "Clear" click suppressed
+  // proposals for: re-proposing on every keystroke after a deliberate
+  // clear would fight the operator, so this only re-arms once the goal
+  // itself changes again.
+  const [clearedForGoal, setClearedForGoal] = useState<string | null>(null)
+  // repoCache (issue #563) holds each github connector's repo list,
+  // fetched on demand while searching for a goal match, keyed by
+  // connector id: avoids re-fetching a connector already tried.
+  const [repoCache, setRepoCache] = useState<Record<string, GitHubRepo[]>>({})
 
   // A repo/connector is considered "attached" once it resolves to a
   // clone URL: mirrors githubSourceReady's own readiness check below.
-  const repoAttached =
-    repoSource === 'github' && !!connectorID && (newRepo ? newRepoName.trim() !== '' : !!selectedRepo)
+  const repoAttached = repoSource === 'github' && !!connectorID && !!selectedRepo
 
   // Kind pre-fill signal 1 (issue #447): a repo/connector attached
   // implies a coding mission. Purely client-side, re-evaluated whenever
@@ -450,81 +467,23 @@ export function MissionForm({
     }
   }, [repoAttached, kindLocked])
 
-  // Consent-at-create for the mission's auto-completion action.
-  // githubDestinationAdded (issue #483) tracks whether the operator has
-  // added a github entry to the unified Destinations section below,
-  // separate from repoSource, since a github destination no longer
-  // requires the Repository section's own clone-source github pick
-  // (create_if_missing lets a scratch mission push to a repo it never
-  // cloned from). Turning the destination off resets onComplete/
-  // createIfMissing/the detected proposal together.
-  const [githubDestinationAdded, setGithubDestinationAdded] = useState(
-    !!(initial?.on_complete || initial?.create_if_missing),
-  )
-  const [onComplete, setOnComplete] = useState<OnComplete>(initial?.on_complete ?? '')
-  const [createIfMissing, setCreateIfMissing] = useState(!!initial?.create_if_missing)
-  // destinationConnectorID/destinationRepoURL override the github
-  // destination's own push target when it differs from the Repository
-  // section's clone source (or when there IS no clone source: a
-  // scratch mission with create_if_missing). Empty defers to
-  // connectorID/the clone repo, the common case.
-  const [destinationConnectorID, setDestinationConnectorID] = useState(
-    initial?.destination_connector_id ?? '',
-  )
-  const [destinationRepoURL, setDestinationRepoURL] = useState(initial?.destination_repo_url ?? '')
-  // detectingDestination/detectedDestination back the "Detect from
-  // goal" action (issue #483): on-demand only, never automatic. The
-  // proposal is shown for the operator to review before it can ever
-  // populate destinationRepoURL.
-  const [detectingDestination, setDetectingDestination] = useState(false)
-  const [detectedDestination, setDetectedDestination] = useState<GitHubDestinationDetection | null>(
-    null,
-  )
-  const detectDestinationFromGoal = () => {
-    if (!goal.trim()) return
-    setDetectingDestination(true)
-    setDetectedDestination(null)
-    detectMissionDestination(goal.trim())
-      .then(setDetectedDestination)
-      .catch(() => setDetectedDestination(null))
-      .finally(() => setDetectingDestination(false))
-  }
-  const applyDetectedDestination = () => {
-    if (!detectedDestination?.found || !detectedDestination.owner || !detectedDestination.repo) return
-    setGithubDestinationAdded(true)
-    setDestinationRepoURL(`https://github.com/${detectedDestination.owner}/${detectedDestination.repo}`)
-    setCreateIfMissing(true)
-    setOnComplete(detectedDestination.mode ?? 'push')
-    setDetectedDestination(null)
-  }
+  // destinationRepoURLs (issue #561) is the checked github destinations'
+  // target-repository override, keyed by destination id: an empty/
+  // missing entry falls back to the attached source repo, or lets the
+  // destination create one when it allows it. Cleared per-id when that
+  // destination is unchecked.
+  const [destinationRepoURLs, setDestinationRepoURLs] = useState<Record<string, string>>({})
 
   // Fetch github-kind connectors once the operator picks the GitHub
-  // clone source OR adds a github destination: most missions touch
-  // neither, so this isn't loaded upfront with agents/routes.
+  // clone source, or once a coding mission's goal might need them for
+  // the repo-mention proposal below (issue #563): most missions never
+  // touch it, so this isn't loaded upfront with agents/routes.
   useEffect(() => {
-    if ((repoSource !== 'github' && !githubDestinationAdded) || githubConnectors !== null) return
+    if ((repoSource !== 'github' && kind !== 'coding') || githubConnectors !== null) return
     listConnectors()
       .then((all) => setGithubConnectors(all.filter((c) => c.kind === 'github' && c.enabled)))
       .catch(() => setGithubConnectors([]))
-  }, [repoSource, githubDestinationAdded, githubConnectors])
-
-  // When the destination has no clone-source connector to fall back on
-  // (no repo picked in the Repository section) and exactly one github
-  // connector is configured, that connector is unambiguous: select it
-  // for the destination automatically rather than forcing a manual
-  // pick of the only option, e.g. after "Use this" on a detected
-  // destination for a scratch mission (issue #483).
-  useEffect(() => {
-    if (
-      !githubDestinationAdded ||
-      connectorID ||
-      destinationConnectorID ||
-      githubConnectors?.length !== 1
-    ) {
-      return
-    }
-    setDestinationConnectorID(githubConnectors[0].id)
-  }, [githubDestinationAdded, connectorID, destinationConnectorID, githubConnectors])
+  }, [repoSource, kind, githubConnectors])
 
   // Fetch the connector's repo list whenever it changes: best-effort,
   // an error surfaces inline rather than blocking the form.
@@ -536,26 +495,13 @@ export function MissionForm({
     setReposLoading(true)
     setReposError(null)
     listConnectorRepos(connectorID)
-      .then(setRepos)
+      .then((r) => {
+        setRepos(r)
+        setRepoCache((prev) => ({ ...prev, [connectorID]: r }))
+      })
       .catch((err) => setReposError(errText(err)))
       .finally(() => setReposLoading(false))
   }, [repoSource, connectorID])
-
-  // Resolve the effective push connector's GitHub identity so the
-  // github destination's fields can say who commits and PRs will be
-  // authored as: best-effort, an unresolved identity just hides the
-  // line. destinationConnectorID wins when set (the destination names
-  // its own connector); otherwise falls back to the clone source's.
-  const effectiveDestinationConnectorID = destinationConnectorID || connectorID
-  useEffect(() => {
-    if (!githubDestinationAdded || !effectiveDestinationConnectorID) {
-      setConnIdentity(null)
-      return
-    }
-    testConnector(effectiveDestinationConnectorID)
-      .then((res) => setConnIdentity(res.identity ?? null))
-      .catch(() => setConnIdentity(null))
-  }, [githubDestinationAdded, effectiveDestinationConnectorID])
 
   const filteredRepos = useMemo(() => {
     if (!repos) return []
@@ -563,6 +509,104 @@ export function MissionForm({
     if (!q) return repos
     return repos.filter((r) => r.full_name.toLowerCase().includes(q))
   }, [repos, repoQuery])
+
+  // Repo proposal from the goal text (issue #563): debounced ~400ms
+  // like the classify preview above, only for a coding mission with no
+  // hand-picked source and at least one github connector. Tries each
+  // github connector's repo list (fetching + caching on demand) until
+  // one yields a match, sets the source on a single match, and lists
+  // "candidates" for the operator to pick from on an ambiguous one.
+  // Never runs again for goal text the operator already cleared a
+  // proposal for.
+  useEffect(() => {
+    // Coding is unavailable while repeating (toggleKind/the repeat
+    // toggle both enforce that), so kind === 'coding' already implies
+    // !repeat here.
+    if (kind !== 'coding' || mode !== 'create') return
+    if (repoSource !== 'none' && !sourceProposed) return // a hand-picked source is never touched
+    if (!githubConnectors || githubConnectors.length === 0) return
+    if (goal.trim() === '' || goal === clearedForGoal) return
+
+    const mentions = extractRepoMentions(goal)
+    if (mentions.length === 0) {
+      setProposalNote(null)
+      setProposalCandidates(null)
+      return
+    }
+
+    let cancelled = false
+    const t = setTimeout(() => {
+      const tryConnectors = async () => {
+        for (const connector of githubConnectors) {
+          let connectorRepos = repoCache[connector.id]
+          if (!connectorRepos) {
+            try {
+              connectorRepos = await listConnectorRepos(connector.id)
+            } catch {
+              continue // best-effort: skip a connector whose repo list fails to load
+            }
+            if (cancelled) return
+            setRepoCache((prev) => ({ ...prev, [connector.id]: connectorRepos! }))
+          }
+          if (connectorRepos.length === 0) continue
+
+          const result = matchRepo(mentions, connectorRepos)
+          if (!result) continue
+          if (cancelled) return
+
+          if ('candidates' in result) {
+            setProposalCandidates({ connectorID: connector.id, repos: result.candidates })
+            setProposalNote(null)
+            return
+          }
+          setRepoSource('github')
+          setSourceProposed(true)
+          setConnectorID(connector.id)
+          setRepos(connectorRepos)
+          setSelectedRepo(result.repo)
+          setProposalCandidates(null)
+          setProposalNote(result.guess ? 'Proposed from the goal (best guess)' : 'Proposed from the goal')
+          return
+        }
+        if (!cancelled) {
+          setProposalNote(null)
+          setProposalCandidates(null)
+        }
+      }
+      void tryConnectors()
+    }, 400)
+
+    return () => {
+      cancelled = true
+      clearTimeout(t)
+    }
+  }, [goal, kind, mode, repoSource, sourceProposed, githubConnectors, clearedForGoal, repoCache])
+
+  // clearProposal resets the repo source and note, and suppresses
+  // further proposals for the current goal text: the operator's clear
+  // click is a deliberate override, not something the next keystroke
+  // should immediately re-propose.
+  const clearProposal = () => {
+    setRepoSource('none')
+    setSourceProposed(false)
+    setConnectorID('')
+    setSelectedRepo(null)
+    setProposalNote(null)
+    setProposalCandidates(null)
+    setClearedForGoal(goal)
+  }
+
+  // pickProposalCandidate resolves an ambiguous proposal by hand: the
+  // operator clicked one of the listed candidate repos.
+  const pickProposalCandidate = (candidateConnectorID: string, repo: GitHubRepo) => {
+    setRepoSource('github')
+    setSourceProposed(false) // an explicit click is a hand pick, not a proposal
+    setConnectorID(candidateConnectorID)
+    setRepos(repoCache[candidateConnectorID] ?? null)
+    setSelectedRepo(repo)
+    setProposalCandidates(null)
+    setProposalNote(null)
+  }
 
   // Live executor pairing/usability preview: coding-only, refetched
   // whenever the kind flips to coding or the route selection (explicit
@@ -684,10 +728,17 @@ export function MissionForm({
     )
     setBudgetCurrency(schedule.mission_template.budget_currency || 'USD')
     setHarness(schedule.mission_template.harness ?? '')
+    setReviewHarness(schedule.mission_template.review_harness ?? '')
     setEnvironment(schedule.mission_template.environment ?? '')
-    setBranchPattern(schedule.mission_template.branch_pattern ?? '')
-    setCommitStyle(schedule.mission_template.commit_style ?? '')
     setDestinationIDs(schedule.mission_template.destination_ids ?? [])
+    setAttachments(
+      (schedule.mission_template.attachments ?? []).map((a) => ({
+        id: a.id,
+        mime: a.mime ?? '',
+        previewUrl: '',
+        name: a.name,
+      })),
+    )
     setExpiresAt(schedule.expires_at ? schedule.expires_at.slice(0, 16) : '')
     setCronError(null)
   }, [mode, schedule])
@@ -792,42 +843,47 @@ export function MissionForm({
   }
 
   // A GitHub source is only meaningful once it can actually resolve to
-  // a clone URL: an existing repo picked, or a new-repo name typed.
-  const githubSourceReady =
-    repoSource !== 'github' ||
-    !!connectorID && (newRepo ? newRepoName.trim() !== '' : !!selectedRepo)
+  // a clone URL: an existing repo picked.
+  const githubSourceReady = repoSource !== 'github' || (!!connectorID && !!selectedRepo)
 
-  // The github destination is ready once it can resolve to SOME push
-  // target: either it reuses the Repository section's clone source
-  // (destinationRepoURL empty, connectorID set from repoSource=github),
-  // or it names its own connector with create_if_missing (a scratch
-  // mission can push without ever cloning) or its own repo_url.
-  const githubDestinationReady =
-    !githubDestinationAdded ||
-    !!effectiveDestinationConnectorID &&
-      (!!destinationRepoURL || !!repoAttached || createIfMissing)
+  // A checked github destination only makes sense on a coding mission
+  // (issue #561): the server rejects that combination with 400.
+  const checkedGithubDestinations = (destinations ?? []).filter(
+    (d) => destinationIDs.includes(d.id) && d.kind === 'github',
+  )
+  const githubDestinationKindOk = kind === 'coding' || checkedGithubDestinations.length === 0
+
+  // Destination suggestion (issue #563): once a source is attached or
+  // proposed, exactly one enabled github destination exists and isn't
+  // already checked, and the goal mentions pushing/opening a PR, hint
+  // at adding it. Never checks it automatically.
+  const enabledGithubDestinations = (destinations ?? []).filter((d) => d.kind === 'github' && d.enabled)
+  const suggestedGithubDestination =
+    (repoAttached || sourceProposed) &&
+    enabledGithubDestinations.length === 1 &&
+    !destinationIDs.includes(enabledGithubDestinations[0].id) &&
+    pushSignalPattern.test(goal)
+      ? enabledGithubDestinations[0]
+      : null
 
   const canSubmit =
     mode === 'edit'
-      ? scheduleName.trim() !== '' && goal.trim() !== '' && validCronShape(cron)
+      ? scheduleName.trim() !== '' &&
+        goal.trim() !== '' &&
+        validCronShape(cron) &&
+        !attachments.some((a) => a.uploading)
       : goal.trim() !== '' &&
         (!repeat || validCronShape(cron)) &&
         githubSourceReady &&
-        githubDestinationReady &&
+        githubDestinationKindOk &&
         !attachments.some((a) => a.uploading) &&
         unusablePhases(executionPlan).length === 0
 
   const submitMission = async () => {
-    let repoURL: string | undefined
-    if (kind === 'coding' && repoSource === 'github' && connectorID) {
-      const repo = newRepo
-        ? await createConnectorRepo(connectorID, {
-            name: newRepoName.trim(),
-            private: newRepoPrivate,
-          })
-        : selectedRepo
-      repoURL = repo?.clone_url
-    }
+    const repoURL = kind === 'coding' && repoSource === 'github' ? selectedRepo?.clone_url : undefined
+    const repoURLOverrides = Object.fromEntries(
+      Object.entries(destinationRepoURLs).filter(([, v]) => v.trim() !== ''),
+    )
     const { id } = await createMission({
       goal: goal.trim(),
       kind,
@@ -844,20 +900,15 @@ export function MissionForm({
       auto_approve_tools: autoApproveTools,
       auto_approve_plan: autoApprovePlan,
       harness: kind === 'coding' ? harness || undefined : undefined,
+      review_harness: light ? undefined : reviewHarness || undefined,
       environment: kind === 'coding' ? environment || undefined : undefined,
-      branch_pattern: kind === 'coding' ? branchPattern.trim() || undefined : undefined,
-      commit_style: kind === 'coding' ? commitStyle || undefined : undefined,
       repo_url: repoURL,
       connector_id: repoURL ? connectorID : undefined,
-      on_complete: githubDestinationAdded && onComplete ? onComplete : undefined,
-      create_if_missing: githubDestinationAdded && createIfMissing ? true : undefined,
-      destination_connector_id:
-        githubDestinationAdded && destinationConnectorID ? destinationConnectorID : undefined,
-      destination_repo_url: githubDestinationAdded && destinationRepoURL ? destinationRepoURL : undefined,
       parent_mission_id: parentMissionId,
       attachments:
         attachments.length > 0 ? attachments.map((a) => ({ id: a.id, name: a.name ?? '' })) : undefined,
       destination_ids: destinationIDs.length > 0 ? destinationIDs : undefined,
+      destination_repo_urls: Object.keys(repoURLOverrides).length > 0 ? repoURLOverrides : undefined,
       promote_kb_collection_id: promoteKBCollectionID || undefined,
       light: kind === 'general' ? light : undefined,
       flow: kind === 'general' ? flow : undefined,
@@ -885,11 +936,14 @@ export function MissionForm({
         budget_currency: budget ? budgetCurrency : undefined,
         auto_approve_tools: autoApproveTools,
         harness: kind === 'coding' ? harness || undefined : undefined,
+        review_harness: light ? undefined : reviewHarness || undefined,
         environment: kind === 'coding' ? environment || undefined : undefined,
-        branch_pattern: kind === 'coding' ? branchPattern.trim() || undefined : undefined,
-        commit_style: kind === 'coding' ? commitStyle || undefined : undefined,
         destination_ids: destinationIDs.length > 0 ? destinationIDs : undefined,
         light: kind === 'general' ? light : undefined,
+        attachments:
+          attachments.length > 0
+            ? attachments.map((a) => ({ id: a.id, name: a.name ?? '' }))
+            : undefined,
       },
       expires_at: expiresAt ? new Date(expiresAt).toISOString() : undefined,
     })
@@ -914,16 +968,15 @@ export function MissionForm({
         budget_currency: budget ? budgetCurrency : undefined,
         auto_approve_tools: autoApproveTools,
         harness: schedule.mission_template.kind === 'coding' ? harness || undefined : undefined,
+        review_harness: light ? undefined : reviewHarness || undefined,
         environment:
           schedule.mission_template.kind === 'coding' ? environment || undefined : undefined,
-        branch_pattern:
-          schedule.mission_template.kind === 'coding'
-            ? branchPattern.trim() || undefined
-            : undefined,
-        commit_style:
-          schedule.mission_template.kind === 'coding' ? commitStyle || undefined : undefined,
         destination_ids: destinationIDs.length > 0 ? destinationIDs : undefined,
         light: schedule.mission_template.kind === 'general' ? light : undefined,
+        attachments:
+          attachments.length > 0
+            ? attachments.map((a) => ({ id: a.id, name: a.name ?? '' }))
+            : undefined,
       },
       expires_at: expiresAt ? new Date(expiresAt).toISOString() : null,
     })
@@ -1049,7 +1102,7 @@ export function MissionForm({
             </span>
           </label>
         )}
-        {mode === 'create' && !repeat && (
+        {(mode === 'create' || mode === 'edit') && (
           <MissionAttachments attachments={attachments} onChange={setAttachments} />
         )}
       </section>
@@ -1066,7 +1119,10 @@ export function MissionForm({
           <div className="inline-flex rounded-lg bg-muted p-1 text-sm">
             <button
               type="button"
-              onClick={() => setRepoSource('none')}
+              onClick={() => {
+                setRepoSource('none')
+                setSourceProposed(false)
+              }}
               aria-pressed={repoSource === 'none'}
               className={`rounded-md px-3 py-1.5 font-medium transition ${
                 repoSource === 'none' ? 'bg-background shadow-sm' : 'text-muted-foreground'
@@ -1076,7 +1132,10 @@ export function MissionForm({
             </button>
             <button
               type="button"
-              onClick={() => setRepoSource('github')}
+              onClick={() => {
+                setRepoSource('github')
+                setSourceProposed(false)
+              }}
               aria-pressed={repoSource === 'github'}
               className={`rounded-md px-3 py-1.5 font-medium transition ${
                 repoSource === 'github' ? 'bg-background shadow-sm' : 'text-muted-foreground'
@@ -1085,6 +1144,37 @@ export function MissionForm({
               GitHub
             </button>
           </div>
+
+          {proposalNote && (
+            <p className="text-xs text-muted-foreground">
+              {proposalNote}{' '}
+              <button
+                type="button"
+                onClick={clearProposal}
+                className="underline underline-offset-2 hover:text-foreground"
+              >
+                Clear
+              </button>
+            </p>
+          )}
+
+          {proposalCandidates && proposalCandidates.repos.length > 0 && (
+            <p className="text-xs text-muted-foreground">
+              Repositories matching the goal:{' '}
+              {proposalCandidates.repos.map((r, i) => (
+                <span key={r.full_name}>
+                  {i > 0 && ', '}
+                  <button
+                    type="button"
+                    onClick={() => pickProposalCandidate(proposalCandidates.connectorID, r)}
+                    className="underline underline-offset-2 hover:text-foreground"
+                  >
+                    {r.full_name}
+                  </button>
+                </span>
+              ))}
+            </p>
+          )}
 
           {repoSource === 'github' && (
             <div className="space-y-3 rounded-lg border border-border p-4">
@@ -1108,6 +1198,7 @@ export function MissionForm({
                         setConnectorID(v)
                         setSelectedRepo(null)
                         setRepoQuery('')
+                        setSourceProposed(false)
                       }}
                     >
                       <SelectTrigger id="mission-connector" className="w-full">
@@ -1123,7 +1214,7 @@ export function MissionForm({
                     </Select>
                   </div>
 
-                  {connectorID && !newRepo && (
+                  {connectorID && (
                     <div className="space-y-1.5">
                       <Label>Repository</Label>
                       <Popover open={repoPickerOpen} onOpenChange={setRepoPickerOpen}>
@@ -1156,6 +1247,7 @@ export function MissionForm({
                                   onSelect={() => {
                                     setSelectedRepo(r)
                                     setRepoPickerOpen(false)
+                                    setSourceProposed(false)
                                   }}
                                 >
                                   <span className="truncate">{r.full_name}</span>
@@ -1170,50 +1262,6 @@ export function MissionForm({
                           </Command>
                         </PopoverContent>
                       </Popover>
-                    </div>
-                  )}
-
-                  {connectorID && (
-                    <label
-                      htmlFor="mission-new-repo"
-                      className="flex items-center gap-2 text-sm"
-                    >
-                      <input
-                        id="mission-new-repo"
-                        type="checkbox"
-                        checked={newRepo}
-                        onChange={(e) => {
-                          setNewRepo(e.target.checked)
-                          setSelectedRepo(null)
-                        }}
-                      />
-                      New repository
-                    </label>
-                  )}
-
-                  {connectorID && newRepo && (
-                    <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
-                      <div className="space-y-1.5">
-                        <Label htmlFor="mission-new-repo-name">Name</Label>
-                        <Input
-                          id="mission-new-repo-name"
-                          value={newRepoName}
-                          onChange={(e) => setNewRepoName(e.target.value)}
-                          placeholder="my-new-repo"
-                        />
-                      </div>
-                      <label
-                        htmlFor="mission-new-repo-private"
-                        className="flex items-end gap-2 pb-2 text-sm"
-                      >
-                        <input
-                          id="mission-new-repo-private"
-                          type="checkbox"
-                          checked={newRepoPrivate}
-                          onChange={(e) => setNewRepoPrivate(e.target.checked)}
-                        />
-                        Private
-                      </label>
                     </div>
                   )}
                 </>
@@ -1483,19 +1531,17 @@ export function MissionForm({
           </label>
         )}
 
-        {((destinations && destinations.length > 0) ||
-          (kind === 'coding' && mode === 'create' && !repeat)) && (
+        {destinations && destinations.length > 0 && (
           <div className="space-y-1.5">
             <Label>Destinations</Label>
             <p className="text-xs text-muted-foreground">
               Where this mission's result is delivered or pushed when it finishes.
             </p>
             <div className="space-y-3 rounded-xl border border-border p-3">
-              {destinations && destinations.length > 0 && (
-                <div className="space-y-1.5">
-                  {destinations.map((d) => (
+              <div className="space-y-1.5">
+                {destinations.map((d) => (
+                  <div key={d.id}>
                     <label
-                      key={d.id}
                       htmlFor={`mission-destination-${d.id}`}
                       className="flex items-center gap-2 text-sm"
                     >
@@ -1503,198 +1549,65 @@ export function MissionForm({
                         id={`mission-destination-${d.id}`}
                         type="checkbox"
                         checked={destinationIDs.includes(d.id)}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          const checked = e.target.checked
                           setDestinationIDs((prev) =>
-                            e.target.checked ? [...prev, d.id] : prev.filter((id) => id !== d.id),
+                            checked ? [...prev, d.id] : prev.filter((id) => id !== d.id),
                           )
-                        }
+                          if (!checked) {
+                            setDestinationRepoURLs((prev) => {
+                              const { [d.id]: _removed, ...rest } = prev
+                              return rest
+                            })
+                          }
+                        }}
                       />
                       <span>{d.name}</span>
                       <span className="text-xs text-muted-foreground uppercase">{d.kind}</span>
                     </label>
-                  ))}
-                </div>
+
+                    {d.kind === 'github' && destinationIDs.includes(d.id) && (
+                      <div className="mt-1.5 ml-6 space-y-1.5">
+                        <Label htmlFor={`mission-destination-repo-${d.id}`}>Target repository</Label>
+                        <Input
+                          id={`mission-destination-repo-${d.id}`}
+                          value={
+                            destinationRepoURLs[d.id] ?? (repoAttached ? selectedRepo?.clone_url : '') ?? ''
+                          }
+                          onChange={(e) =>
+                            setDestinationRepoURLs((prev) => ({ ...prev, [d.id]: e.target.value }))
+                          }
+                          placeholder="https://github.com/owner/repo"
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          Leave empty to push back to the source repository, or to create one when
+                          the destination allows it.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {!githubDestinationKindOk && (
+                <p className="text-xs text-destructive">
+                  A GitHub destination only applies to a coding mission.
+                </p>
               )}
 
-              {kind === 'coding' && mode === 'create' && !repeat && (
-                <div className={destinations && destinations.length > 0 ? 'border-t border-border pt-3' : undefined}>
-                  <div className="flex items-center justify-between gap-2">
-                    <label htmlFor="mission-destination-github" className="flex items-center gap-2 text-sm">
-                      <input
-                        id="mission-destination-github"
-                        type="checkbox"
-                        checked={githubDestinationAdded}
-                        onChange={(e) => {
-                          setGithubDestinationAdded(e.target.checked)
-                          if (!e.target.checked) {
-                            setOnComplete('')
-                            setCreateIfMissing(false)
-                            setDestinationConnectorID('')
-                            setDestinationRepoURL('')
-                            setDetectedDestination(null)
-                          } else if (!onComplete) {
-                            setOnComplete('push')
-                          }
-                        }}
-                      />
-                      <span>GitHub</span>
-                      <span className="text-xs text-muted-foreground uppercase">push / pr</span>
-                    </label>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={!goal.trim() || detectingDestination}
-                      onClick={detectDestinationFromGoal}
-                    >
-                      {detectingDestination ? 'Detecting…' : 'Detect from goal'}
-                    </Button>
-                  </div>
-
-                  {detectedDestination && (
-                    <div className="mt-3 rounded-md border border-border bg-muted/30 p-2.5 text-sm">
-                      {detectedDestination.found ? (
-                        <div className="flex items-center justify-between gap-2">
-                          <span>
-                            Detected{' '}
-                            <span className="font-medium text-foreground">
-                              {detectedDestination.owner}/{detectedDestination.repo}
-                            </span>{' '}
-                            ({detectedDestination.mode === 'push_pr' ? 'push + PR' : 'push'})
-                          </span>
-                          <div className="flex shrink-0 gap-2">
-                            <Button type="button" size="sm" onClick={applyDetectedDestination}>
-                              Use this
-                            </Button>
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              onClick={() => setDetectedDestination(null)}
-                            >
-                              Discard
-                            </Button>
-                          </div>
-                        </div>
-                      ) : (
-                        <span className="text-muted-foreground">
-                          No repository detected in the goal text.
-                        </span>
-                      )}
-                    </div>
-                  )}
-
-                  {githubDestinationAdded && (
-                    <div className="mt-3 space-y-3 rounded-lg border border-border p-3">
-                      <p className="text-xs text-muted-foreground">
-                        Reuses the Repository section's connector/repo by default. Override below to
-                        push somewhere else.
-                      </p>
-
-                      {githubConnectors === null ? (
-                        <p className="text-sm text-muted-foreground">Loading connectors…</p>
-                      ) : githubConnectors.length === 0 ? (
-                        <p className="text-sm text-muted-foreground">
-                          No GitHub connectors configured yet.{' '}
-                          <Link to="/settings/connectors" className="underline underline-offset-2">
-                            Add one in Settings → Connectors
-                          </Link>
-                          .
-                        </p>
-                      ) : (
-                        <>
-                          <div className="space-y-1.5">
-                            <Label htmlFor="mission-destination-connector">
-                              Connector (override)
-                            </Label>
-                            <Select
-                              value={destinationConnectorID || connectorID}
-                              onValueChange={(v) =>
-                                setDestinationConnectorID(v === connectorID ? '' : v)
-                              }
-                            >
-                              <SelectTrigger id="mission-destination-connector" className="w-full">
-                                <SelectValue placeholder="Same as repository connector" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                {githubConnectors.map((c) => (
-                                  <SelectItem key={c.id} value={c.id}>
-                                    {c.name}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </div>
-
-                          <div className="space-y-1.5">
-                            <Label htmlFor="mission-destination-repo-url">Repository (override)</Label>
-                            <Input
-                              id="mission-destination-repo-url"
-                              value={destinationRepoURL}
-                              onChange={(e) => setDestinationRepoURL(e.target.value)}
-                              placeholder="Same as the Repository section's clone URL"
-                            />
-                          </div>
-
-                          <label
-                            htmlFor="mission-create-if-missing"
-                            className="flex items-start gap-2 text-sm"
-                          >
-                            <input
-                              id="mission-create-if-missing"
-                              type="checkbox"
-                              checked={createIfMissing}
-                              onChange={(e) => setCreateIfMissing(e.target.checked)}
-                              className="mt-0.5"
-                            />
-                            <span>
-                              Create the repository if it doesn't exist
-                              <span className="block text-xs text-muted-foreground">
-                                Lets a scratch mission (or a repo that hasn't been created yet) push
-                                somewhere new instead of failing.
-                              </span>
-                            </span>
-                          </label>
-
-                          <div className="space-y-1.5">
-                            <Label htmlFor="mission-on-complete">Mode</Label>
-                            <Select
-                              value={onComplete || ON_COMPLETE_NONE}
-                              onValueChange={(v) =>
-                                setOnComplete(v === ON_COMPLETE_NONE ? '' : (v as OnComplete))
-                              }
-                            >
-                              <SelectTrigger id="mission-on-complete" className="w-full">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                {onCompleteChoices.map((c) => (
-                                  <SelectItem key={c.value} value={c.value}>
-                                    {c.label}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                            <p className="text-xs text-muted-foreground">
-                              What happens automatically when the mission finishes. A human always
-                              chooses this up front; the model never decides.
-                            </p>
-                          </div>
-
-                          {connIdentity && (
-                            <p className="text-xs text-muted-foreground">
-                              Commits and pull requests will be authored as{' '}
-                              <span className="font-medium text-foreground">
-                                {connIdentity.name || connIdentity.login}
-                              </span>{' '}
-                              ({connIdentity.email})
-                            </p>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  )}
-                </div>
+              {suggestedGithubDestination && (
+                <p className="text-xs text-muted-foreground">
+                  The goal mentions pushing; add the {suggestedGithubDestination.name} destination?{' '}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setDestinationIDs((prev) => [...prev, suggestedGithubDestination.id])
+                    }
+                    className="underline underline-offset-2 hover:text-foreground"
+                  >
+                    Add
+                  </button>
+                </p>
               )}
             </div>
           </div>
@@ -1855,35 +1768,28 @@ export function MissionForm({
                   )}
                 </div>
               )}
-              {kind === 'coding' && (
+              {!light && (
                 <div className="space-y-1.5">
-                  <Label htmlFor="mission-branch-pattern">Branch pattern</Label>
-                  <Input
-                    id="mission-branch-pattern"
-                    value={branchPattern}
-                    onChange={(e) => setBranchPattern(e.target.value)}
-                    placeholder="Default (from settings)"
-                  />
-                </div>
-              )}
-              {kind === 'coding' && (
-                <div className="space-y-1.5">
-                  <Label htmlFor="mission-commit-style">Commit style</Label>
+                  <Label htmlFor="mission-review-harness">Review harness</Label>
                   <Select
-                    value={commitStyle || COMMIT_STYLE_DEFAULT}
-                    onValueChange={(v) => setCommitStyle(v === COMMIT_STYLE_DEFAULT ? '' : v)}
+                    value={reviewHarness || EXECUTOR_DEFAULT}
+                    onValueChange={(v) => setReviewHarness(v === EXECUTOR_DEFAULT ? '' : v)}
                   >
-                    <SelectTrigger id="mission-commit-style" className="w-full">
+                    <SelectTrigger id="mission-review-harness" className="w-full">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      {commitStyleChoices.map((c) => (
+                      {reviewHarnessChoices.map((c) => (
                         <SelectItem key={c.value} value={c.value}>
                           {c.label}
                         </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
+                  <p className="text-xs text-muted-foreground">
+                    Runs the review round as a read-only CLI in the mission sandbox; native review is
+                    the fallback whenever it cannot run.
+                  </p>
                 </div>
               )}
               {kind === 'general' && !repeat && (

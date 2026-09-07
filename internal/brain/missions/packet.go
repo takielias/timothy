@@ -48,10 +48,10 @@ type WorkPacket struct {
 	// the worker the content of what the user explicitly pinned at
 	// create time.
 	ReferencedContext string
-	// Attachments are the mission's create-time PDF documents ("pdf"
-	// Sources entries) -- reach every worker turn via Render, including
-	// a delegated executor's turn (executor packets also go through
-	// Render).
+	// Attachments are the mission's create-time documents, images, and
+	// audio clips ("pdf" Sources entries, issue #359) -- reach every
+	// worker turn via Render, including a delegated executor's turn
+	// (executor packets also go through Render).
 	Attachments []SourceEntry
 	// SkillsIndex is the rendered skill index for the mission's agent
 	// (skills.Index over the agent's allowlist), resolved at packet
@@ -97,7 +97,7 @@ const toolDisciplineNote = " Tool discipline: before each tool call, know what y
 // native (in-process loop.Agent) worker turn must follow — meaningless
 // to a delegated CLI, which has neither tool (RenderForDelegated uses
 // delegatedSystemPreamble instead).
-const nativeSystemPreamble = "You are executing one unit of a plan. Work toward the goal, then end your turn with exactly one mission_status tool call: done (with evidence), retry (with analysis), or blocked (with a question). Create or update files ONLY with the write_file tool using workspace-relative paths — never shell redirects (>, >>) or heredocs, which classify as writes requiring interactive approval and will stall you; artifact tracking depends on write_file being the only way files get created. Use shell for reading and checking, not writing. The harness verifies your declared artifacts exist on disk; describing a file is not producing it. The goal's explicit constraints outrank the plan: if a plan unit requires violating something the goal explicitly forbids, do not do it, report the conflict via mission_status with outcome blocked instead. When you end with retry or blocked, include a handoff note summarizing state, remaining work, and gotchas — the next session starts fresh and sees only your handoff, the plan, and the git log." + toolDisciplineNote
+const nativeSystemPreamble = "You are executing one unit of a plan. Work toward the goal, then end your turn with exactly one mission_status tool call: done (with evidence), retry (with analysis), or blocked (with a question). Create or update files ONLY with the write_file tool using workspace-relative paths — never shell redirects (>, >>) or heredocs, which classify as writes requiring interactive approval and will stall you; artifact tracking depends on write_file being the only way files get created. Use shell for reading and checking, not writing. The harness commits the unit's files itself after your turn, so never run git add, commit, reset, stash, or checkout. The harness verifies your declared artifacts exist on disk; describing a file is not producing it. The goal's explicit constraints outrank the plan: if a plan unit requires violating something the goal explicitly forbids, do not do it, report the conflict via mission_status with outcome blocked instead. When you end with retry or blocked, include a handoff note summarizing state, remaining work, and gotchas — the next session starts fresh and sees only your handoff, the plan, and the git log." + toolDisciplineNote
 
 // lightSystemPreamble is nativeSystemPreamble's counterpart for a light
 // mission (D-069): single pass, no plan, no artifact check — the
@@ -292,9 +292,23 @@ func renderOpenFindings(findings []Finding, round, maxRounds int) string {
 	return b.String()
 }
 
+// attachmentLabel names an attachment's rendered section by mime
+// (issue #359): an image renders as its caption, an audio clip as its
+// transcript, everything else (pdf/text) as a document.
+func attachmentLabel(mime string) string {
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		return "Attached image %s (description):\n%s\n"
+	case strings.HasPrefix(mime, "audio/"):
+		return "Attached audio %s (transcript):\n%s\n"
+	default:
+		return "Attached document %s:\n%s\n"
+	}
+}
+
 // renderAttachments formats each attachment with markdown into a
-// "Attached document <name>:" section, neutralized like every other
-// model-reachable field — shared by WorkPacket.Render and the
+// section labeled by mime (attachmentLabel), neutralized like every
+// other model-reachable field, shared by WorkPacket.Render and the
 // discover/plan runner sessions (runner.go) so the three near-identical
 // loops stay in sync. An attachment with no markdown (a conversion
 // that somehow never ran) renders nothing.
@@ -308,7 +322,7 @@ func renderAttachments(atts []SourceEntry) string {
 		if name == "" {
 			name = a.ID
 		}
-		fmt.Fprintf(&b, "\nAttached document %s:\n%s\n", NeutralizeSlot(name), NeutralizeSlot(a.Markdown))
+		fmt.Fprintf(&b, "\n"+attachmentLabel(a.Mime), NeutralizeSlot(name), NeutralizeSlot(a.Markdown))
 	}
 	return b.String()
 }

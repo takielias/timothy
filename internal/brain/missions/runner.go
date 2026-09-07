@@ -314,6 +314,8 @@ const operatorNotePrefix = "Operator note: "
 // operator notes past the watermark, and advances it by however many it
 // found. A poll error logs and returns nil rather than failing the
 // turn: steering is a best-effort mid-run nicety, not load-bearing.
+// Shares its watermark logic with the delegated runner's pi rpc-mode
+// injection (issue #358) via freshOperatorNotes.
 func (r *nativeRunner) steeringFor(missionID string, seeded []ProgressNote) func(ctx context.Context) []string {
 	if r.progressReader == nil {
 		return nil
@@ -325,23 +327,37 @@ func (r *nativeRunner) steeringFor(missionID string, seeded []ProgressNote) func
 			r.log.Warn("mission worker: poll steering notes failed", "mission_id", missionID, "error", err)
 			return nil
 		}
-		var operator []string
-		for _, n := range notes {
-			if strings.HasPrefix(n.Note, operatorNotePrefix) {
-				operator = append(operator, strings.TrimPrefix(n.Note, operatorNotePrefix))
-			}
-		}
-		if watermark >= len(operator) {
+		fresh, newWatermark := freshOperatorNotes(notes, watermark)
+		watermark = newWatermark
+		if len(fresh) == 0 {
 			return nil
 		}
-		fresh := operator[watermark:]
-		watermark = len(operator)
 		out := make([]string, len(fresh))
 		for i, note := range fresh {
 			out[i] = "Operator steering note (mid-run): " + note
 		}
 		return out
 	}
+}
+
+// freshOperatorNotes extracts the operator-authored notes in notes past
+// watermark (an index into the operator-only subsequence, not into
+// notes itself), stripping operatorNotePrefix, and returns them
+// alongside the advanced watermark. The shared primitive behind
+// nativeRunner.steeringFor and delegatedRunner's rpc-mode steer
+// injection (issue #358): both need "which operator notes are new since
+// last time" and nothing else.
+func freshOperatorNotes(notes []ProgressNote, watermark int) (fresh []string, newWatermark int) {
+	var operator []string
+	for _, n := range notes {
+		if strings.HasPrefix(n.Note, operatorNotePrefix) {
+			operator = append(operator, strings.TrimPrefix(n.Note, operatorNotePrefix))
+		}
+	}
+	if watermark >= len(operator) {
+		return nil, watermark
+	}
+	return operator[watermark:], len(operator)
 }
 
 // countOperatorNotes counts how many of notes are operator-authored
@@ -891,6 +907,11 @@ const kbSearchNoHits = "no matching passages found"
 // document id and its fused score together.
 var kbSearchSourceLine = regexp.MustCompile(`^Source: kb://(\S+) \(score ([-\d.]+)\)$`)
 
+// verifyCmdGitInvocation matches a git invocation as a shell word: at the
+// start of the command or after a non-word character, so it catches
+// "git status" and "&& git diff" but not "digit" or "widget.md".
+var verifyCmdGitInvocation = regexp.MustCompile(`(^|\W)git\s`)
+
 // kbSearchHitTrace pulls document ids, titles, and fused scores out of
 // search_kb's rendered result (kbsearch.go's formatKBHits), the same
 // parse-the-rendered-output approach webSearchResultURLs uses for
@@ -1185,7 +1206,7 @@ func (r *nativeRunner) DiscoverSession(ctx context.Context, m Mission) (notes, s
 	if rc := m.ReferencedContext(); rc != "" {
 		user += "\n\nReferenced context:\n" + NeutralizeSlot(rc)
 	}
-	if notes := recentProgressNotes(m.Progress, progressRenderCap); notes != "" {
+	if notes := progressWithOperatorNotes(m.Progress, progressRenderCap, nil); notes != "" {
 		user += "\n\nProgress so far (includes any operator answers to prior questions):\n" + notes
 	}
 	user += renderAttachments(m.Attachments())
@@ -1309,6 +1330,15 @@ func (r *nativeRunner) applyDiscoverReport(ctx context.Context, m Mission, repor
 	return fmt.Sprintf("Stack: %s. The sandbox has no preinstalled toolchain for it; the plan must include a unit that installs what the work needs before building or testing.\n\n%s", NeutralizeSlot(stack), report.Findings)
 }
 
+// reviewSystemPrompt is the reviewer's system prompt; reviewSystemToolCall
+// is the native closing sentence. The delegated reviewer (issue #582)
+// reuses the body with its own closing instruction, so the native
+// prompt stays byte-identical.
+const (
+	reviewSystemPrompt   = "You are reviewing units of a mission's work. Each unit's acceptance criteria, the harness's own check results, the diff and the actual artifact contents (read from disk by the harness, not reported by the worker) are all below; judge against THEM. Look for real reasons to reject before approving: a criterion the work does not satisfy, unsupported claims, missing substance. Do NOT reject for material you were not given (the harness supplies everything there is) and do not re-run checks the harness already reports as passed. Every blocking finding must name a file that appears in the diff or the artifacts and quote the line that shows the gap in evidence; a blocking finding without both is demoted to minor. The changed-files stat spans every unit of the plan: judge a criterion about files a unit must not touch (\"no other files modified\") against the files listed for that unit alone, never against another unit's files. Prior rounds' open findings are listed with ids: name each one the work has now closed in resolved, and report only NEW gaps as findings."
+	reviewSystemToolCall = " End your turn with exactly one review_verdict tool call."
+)
+
 // RunReview judges the packet: the mission's goal and plan, the
 // harness-read artifact contents (never the worker's description of
 // them), the baseline diff when one exists, the prior rounds' open
@@ -1316,7 +1346,7 @@ func (r *nativeRunner) applyDiscoverReport(ctx context.Context, m Mission, repor
 // session (D-092): findings carry across rounds as mission state, so
 // no reviewer transcript is retained to anchor the next verdict.
 func (r *nativeRunner) RunReview(ctx context.Context, m Mission, packet ReviewPacket) (ReviewVerdict, error) {
-	system := "You are reviewing units of a mission's work. Each unit's acceptance criteria, the harness's own check results, the diff and the actual artifact contents (read from disk by the harness, not reported by the worker) are all below; judge against THEM. Look for real reasons to reject before approving: a criterion the work does not satisfy, unsupported claims, missing substance. Do NOT reject for material you were not given (the harness supplies everything there is) and do not re-run checks the harness already reports as passed. Every blocking finding must name a file that appears in the diff or the artifacts and quote the line that shows the gap in evidence; a blocking finding without both is demoted to minor. The changed-files stat spans every unit of the plan: judge a criterion about files a unit must not touch (\"no other files modified\") against the files listed for that unit alone, never against another unit's files. Prior rounds' open findings are listed with ids: name each one the work has now closed in resolved, and report only NEW gaps as findings. End your turn with exactly one review_verdict tool call."
+	system := reviewSystemPrompt + reviewSystemToolCall
 	messages := []provider.Message{{Role: "user", Content: renderReviewContent(packet)}}
 
 	extra := append([]*tools.Tool{ReviewVerdictTool()}, r.missionTools(m)...)
@@ -1539,17 +1569,21 @@ func renderReviewContent(p ReviewPacket) string {
 		b.WriteString("\n")
 	}
 	if len(p.Progress) > 0 {
-		notes := p.Progress
-		if len(notes) > progressRenderCap {
-			notes = notes[len(notes)-progressRenderCap:]
-		}
 		if p.FindingsOnly {
 			b.WriteString("\nWorker notes since the last review round (its own account of the rework; verify against the files above):\n")
+			notes := p.Progress
+			if len(notes) > progressRenderCap {
+				notes = notes[len(notes)-progressRenderCap:]
+			}
+			for _, n := range notes {
+				fmt.Fprintf(&b, "- %s\n", NeutralizeSlot(n.Note))
+			}
 		} else {
+			// issue #357: pin any older operator steering note ahead of the
+			// last progressRenderCap notes so a full review round never
+			// drops it.
 			b.WriteString("\nRecent progress (includes any operator steering notes):\n")
-		}
-		for _, n := range notes {
-			fmt.Fprintf(&b, "- %s\n", NeutralizeSlot(n.Note))
+			b.WriteString(progressWithOperatorNotes(p.Progress, progressRenderCap, NeutralizeSlot))
 		}
 	}
 	if p.Evidence != "" {
@@ -1568,7 +1602,7 @@ func renderReviewContent(p ReviewPacket) string {
 // (D-077), and assumptions. Kept as one shared string so
 // generate/prove's unit parsing (parsePlan) never has to distinguish
 // which mode produced a plan.
-const planUnitShapeRules = " Every unit must list at least one artifact, the workspace-relative file(s) the unit must produce (for a report-style goal, the report file itself is the artifact); the harness itself checks each exists and is non-empty, so name the real deliverables. Every unit must also list 2 to 6 acceptance criteria: short single lines taken from the goal stating what the unit's output must satisfy (constraints, required content, format), because the reviewer judges the unit against these criteria rather than the goal text; name the artifact file in a criterion when judging it requires reading its contents. Optionally list scope: the workspace-relative files or directories the unit may touch (defaults to the artifact directories). verify_cmd is executed literally as `/bin/sh -c \"<verify_cmd>\"` in the mission's own workspace directory; it must be a real POSIX shell command (using binaries like grep, test, wc, NOT a tool name from your own tool list, which does not exist as a shell command) and must check the CONTENT of the artifacts (e.g. grep -qi 'retry-after' summary.md), never a bare echo, which proves nothing. Never use command substitution ($(...) or backticks) in verify_cmd; write the direct command instead; for a line-count check use awk, e.g. `awk 'END{exit NR<10}' report.md`, NEVER `test $(wc -l ...)`. Use paths relative to the workspace; never /tmp or any absolute path outside it, since the worker's shell is confined to the workspace. If the goal cannot be achieved as stated (it forbids the only possible action, contradicts what actually exists in the workspace, or is self-contradictory), do not invent a workaround plan: call submit_plan with infeasible=true and a reason instead of units. If the goal left something ambiguous and you resolved it silently, list it in assumptions with the default you chose (e.g. \"no language version was specified\" -> \"Python 3.12\", \"output format unspecified\" -> \"single markdown file\"); leave assumptions empty when nothing was ambiguous. End your turn with exactly one submit_plan tool call."
+const planUnitShapeRules = " Every unit must list at least one artifact, the workspace-relative file(s) the unit must produce (for a report-style goal, the report file itself is the artifact); the harness itself checks each exists and is non-empty, so name the real deliverables. Every unit must also list 2 to 6 acceptance criteria: short single lines taken from the goal stating what the unit's output must satisfy (constraints, required content, format), because the reviewer judges the unit against these criteria rather than the goal text; name the artifact file in a criterion when judging it requires reading its contents. Optionally list scope: the workspace-relative files or directories the unit may touch (defaults to the artifact directories). verify_cmd is executed literally as `/bin/sh -c \"<verify_cmd>\"` in the mission's own workspace directory; it must be a real POSIX shell command (using binaries like grep, test, wc, NOT a tool name from your own tool list, which does not exist as a shell command) and must check the CONTENT of the artifacts (e.g. grep -qi 'retry-after' summary.md), never a bare echo, which proves nothing. Never use command substitution ($(...) or backticks) in verify_cmd; write the direct command instead; for a line-count check use awk, e.g. `awk 'END{exit NR<10}' report.md`, NEVER `test $(wc -l ...)`. The harness commits each unit's files itself after the worker turn, so criteria and verify_cmd must judge file CONTENT only, never git status, staging, untracked, or uncommitted state. Use paths relative to the workspace; never /tmp or any absolute path outside it, since the worker's shell is confined to the workspace. If the goal cannot be achieved as stated (it forbids the only possible action, contradicts what actually exists in the workspace, or is self-contradictory), do not invent a workaround plan: call submit_plan with infeasible=true and a reason instead of units. If the goal left something ambiguous and you resolved it silently, list it in assumptions with the default you chose (e.g. \"no language version was specified\" -> \"Python 3.12\", \"output format unspecified\" -> \"single markdown file\"); leave assumptions empty when nothing was ambiguous. End your turn with exactly one submit_plan tool call."
 
 // planSystemPrompt builds PlanSession's system prompt: the design-mode
 // opening (break the goal into units from scratch) or, when hasPlan is
@@ -1765,6 +1799,14 @@ func parsePlan(raw string) (Plan, error) {
 	for _, u := range plan.Units {
 		if strings.Contains(u.VerifyCmd, "$(") || strings.Contains(u.VerifyCmd, "`") {
 			return Plan{}, fmt.Errorf("mission runner: verify_cmd must not use command substitution ($(...) or backticks), write the direct command instead")
+		}
+	}
+	// The harness commits every unit's files itself after the worker turn
+	// (Workspace.CommitUnit), so a verify_cmd that runs git always checks
+	// a stale or wrong assumption about working-tree state.
+	for _, u := range plan.Units {
+		if verifyCmdGitInvocation.MatchString(u.VerifyCmd) {
+			return Plan{}, fmt.Errorf("mission runner: unit %q verify_cmd must not run git: the harness commits each unit itself, check artifact content instead", u.Title)
 		}
 	}
 	// D-068: every unit must declare at least one artifact so the

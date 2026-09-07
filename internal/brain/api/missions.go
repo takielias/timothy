@@ -28,15 +28,15 @@ import (
 	"github.com/SumonMSelim/timothy/internal/brain/tools"
 	"github.com/SumonMSelim/timothy/internal/gateway/ledger"
 	"github.com/SumonMSelim/timothy/internal/gateway/router"
-	"github.com/SumonMSelim/timothy/internal/platform/markitdown"
 	"github.com/SumonMSelim/timothy/internal/platform/pdfgen"
 	"github.com/SumonMSelim/timothy/internal/secretstore"
 )
 
-// maxMissionAttachments caps how many PDFs a single mission create
-// request may attach — bounds worst-case prompt size across every
-// discover/plan/work turn (each attachment's markdown is rendered every
-// turn, unlike chat where it's per-message).
+// maxMissionAttachments caps how many documents/images/audio clips a
+// single mission create request may attach, bounding worst-case prompt
+// size across every discover/plan/work turn (each attachment's
+// markdown/caption/transcript is rendered every turn, unlike chat
+// where it's per-message).
 const maxMissionAttachments = 8
 
 // missionAttachmentStore is the slice of *attachments.Store missions
@@ -69,13 +69,17 @@ type missionAttachmentStore interface {
 // provider/model per mission id from the cost ledger (D-05x's
 // ledger.Aggregator.TopModelByMission) for the list response's
 // top_model decoration — nil (no ledger wiring) omits the field.
-// attachmentStore/markitdownURL back create-time PDF attachment
-// conversion (see resolveAttachments) — a nil store or empty URL
-// disables attachments. attachmentStore takes the narrow interface
-// (not *attachments.Store) so the caller's own nil-box guard (a nil
-// *attachments.Store boxed here would be a non-nil interface value)
-// happens once, at the call site — same shape as chat.Service.SetAttachments.
-func (a *API) registerMissions(handle func(pattern string, h http.Handler), store *missions.Store, driver *missions.Driver, notifier *missions.Notifier, agentReg *agents.Store, workspace *missions.Workspace, resolveSecret func(context.Context, string) (string, error), routeForRole func(context.Context, string) string, classify agents.Classify, codingExecutorDefault func(context.Context) string, resolveRoute func(context.Context, string, string) (*gwclient.ResolvedRoute, error), nameMission func(context.Context, string) string, topModels func(context.Context, []string) (map[string]ledger.ModelUsed, error), conns *connectors.Manager, attachmentStore missionAttachmentStore, markitdownURL string, pdfService *pdfgenservice.Service, kbStore *kb.Store, kbIngest kbIngester, kbEnrich *kb.Enricher, extractGitHubDestination func(context.Context, string) chat.GitHubDestinationProposal) {
+// attachmentStore/markitdownURL/whisperURL/caption back create-time
+// attachment conversion (see attachmentResolver, issue #359): a nil
+// store disables attachments entirely; an empty markitdownURL/
+// whisperURL or nil caption only disable the corresponding attachment
+// type (pdf/audio/image respectively), each rejected with its own 400
+// naming the missing sidecar. attachmentStore takes the narrow
+// interface (not *attachments.Store) so the caller's own nil-box guard
+// (a nil *attachments.Store boxed here would be a non-nil interface
+// value) happens once, at the call site, same shape as
+// chat.Service.SetAttachments.
+func (a *API) registerMissions(handle func(pattern string, h http.Handler), store *missions.Store, driver *missions.Driver, notifier *missions.Notifier, agentReg *agents.Store, workspace *missions.Workspace, resolveSecret func(context.Context, string) (string, error), routeForRole func(context.Context, string) string, classify agents.Classify, codingExecutorDefault func(context.Context) string, resolveRoute func(context.Context, string, string) (*gwclient.ResolvedRoute, error), nameMission func(context.Context, string) string, topModels func(context.Context, []string) (map[string]ledger.ModelUsed, error), conns *connectors.Manager, attachmentStore missionAttachmentStore, markitdownURL string, pdfService *pdfgenservice.Service, kbStore *kb.Store, kbIngest kbIngester, kbEnrich *kb.Enricher, whisperURL string, caption func(context.Context, string, []byte) string) {
 	if store == nil {
 		return
 	}
@@ -103,11 +107,11 @@ func (a *API) registerMissions(handle func(pattern string, h http.Handler), stor
 			return a.Harness, true
 		}
 	}
-	h := &missionAPI{store: store, driver: driver, notifier: notifier, agentReg: agentReg, resolveAgentRoute: resolveAgentRoute, resolveAgentHarness: resolveAgentHarness, workspace: workspace, resolveSecret: resolveSecret, routeForRole: routeForRole, classify: classify, codingExecutorDefault: codingExecutorDefault, resolveRoute: resolveRoute, nameMission: nameMission, topModels: topModels, conns: conns, perms: a.perms, dir: a.dir, log: a.log, attachments: attachmentStore, markitdownURL: markitdownURL, markitdownHTTP: &http.Client{}, pdfService: pdfService, resolveReferences: a.svc.ResolveReferences, kbStore: kbStore, kbIngest: kbIngest, kbEnrich: kbEnrich, extractGitHubDestination: extractGitHubDestination}
+	resolver := &attachmentResolver{store: attachmentStore, markitdownURL: markitdownURL, markitdownHTTP: &http.Client{}, whisperURL: whisperURL, whisperHTTP: &http.Client{}, caption: caption}
+	h := &missionAPI{store: store, driver: driver, notifier: notifier, agentReg: agentReg, resolveAgentRoute: resolveAgentRoute, resolveAgentHarness: resolveAgentHarness, workspace: workspace, resolveSecret: resolveSecret, routeForRole: routeForRole, classify: classify, codingExecutorDefault: codingExecutorDefault, resolveRoute: resolveRoute, nameMission: nameMission, topModels: topModels, conns: conns, perms: a.perms, dir: a.dir, log: a.log, attachments: resolver, rawAttachments: attachmentStore, pdfService: pdfService, resolveReferences: a.svc.ResolveReferences, kbStore: kbStore, kbIngest: kbIngest, kbEnrich: kbEnrich}
 	handle("GET /v1/missions", a.auth(http.HandlerFunc(h.list)))
 	handle("POST /v1/missions", a.auth(http.HandlerFunc(h.create)))
 	handle("POST /v1/missions/classify", a.auth(http.HandlerFunc(h.classifyGoal)))
-	handle("POST /v1/missions/detect-destination", a.auth(http.HandlerFunc(h.detectDestination)))
 	handle("GET /v1/missions/executor-options", a.auth(http.HandlerFunc(h.executorOptions)))
 	handle("GET /v1/missions/execution-plan", a.auth(http.HandlerFunc(h.executionPlan)))
 	handle("GET /v1/missions/{id}", a.auth(http.HandlerFunc(h.get)))
@@ -196,13 +200,14 @@ type missionAPI struct {
 	// mission-specific store.
 	dir Directory
 	log *slog.Logger
-	// attachments resolves create-time PDF refs; nil disables mission
+	// attachments resolves create-time attachment refs (pdf/text/image/
+	// audio, issue #359); a nil store field on it disables mission
 	// attachments entirely (same as chat's own attachments field).
-	attachments missionAttachmentStore
-	// markitdownURL is the sidecar's base URL for PDF conversion; ""
-	// rejects any attachment with a 400 naming the missing sidecar.
-	markitdownURL  string
-	markitdownHTTP *http.Client
+	attachments *attachmentResolver
+	// rawAttachments is the same store attachments.store wraps, kept
+	// separately for promoteKB below (destinations.PromoteMission wants
+	// Open only, not the full resolver).
+	rawAttachments missionAttachmentStore
 	// pdfService renders export-pdf requests via the pdfgen sidecar; nil
 	// (PDFGEN_URL unset or attachments disabled) 503s the endpoint.
 	pdfService *pdfgenservice.Service
@@ -224,11 +229,6 @@ type missionAPI struct {
 	// the operator-owned destinations table (D-061's exfiltration
 	// guard: an id must exist AND be enabled) — nil (destinations
 	// disabled) rejects any non-empty destination_ids.
-	// extractGitHubDestination backs POST /v1/missions/detect-destination
-	// (issue #483, chat.ExtractGitHubDestinationOverGateway): nil (no
-	// gateway wiring) makes the endpoint always report found=false, same
-	// never-errors degrade as the function itself.
-	extractGitHubDestination func(context.Context, string) chat.GitHubDestinationProposal
 }
 
 // destinationLookup is the narrow slice of *destinations.Store the
@@ -364,11 +364,6 @@ type missionResponse struct {
 	// read this exactly as before the light column was dropped.
 	Light    bool   `json:"light"`
 	Worktree string `json:"worktree,omitempty"`
-	// OnComplete is derived from the mission's github Destinations entry
-	// (issue #480 dropped the on_complete column): the web client's own
-	// auto-push/auto-PR badge (MissionDetail.tsx) reads this exactly as
-	// before.
-	OnComplete string `json:"on_complete,omitempty"`
 	// RepoURL/ConnectorID are derived from the mission's "github" Sources
 	// entry (issue #481 dropped the repo_url/connector_id columns): the
 	// web client's own github-connection checks (MissionDetail.tsx,
@@ -395,7 +390,7 @@ func (h *missionAPI) decorateTopModels(ctx context.Context, rows []missions.Miss
 			atts = append(atts, responseAttachment{ID: a.ID, Mime: a.Mime, Name: a.Name})
 		}
 		out[i] = missionResponse{
-			Mission: m, Light: m.Flow == missions.FlowLight, Worktree: m.WorktreePath(), OnComplete: m.OnComplete(),
+			Mission: m, Light: m.Flow == missions.FlowLight, Worktree: m.WorktreePath(),
 			RepoURL: github.RepoURL, ConnectorID: github.ConnectorID, Attachments: atts,
 		}
 	}
@@ -466,6 +461,11 @@ type createMissionRequest struct {
 	// "native" forces native (stored as ""), anything else must name a
 	// registered harness. Rejected outright on kind=general.
 	Harness string `json:"harness"`
+	// ReviewHarness (issue #582) names the registered executor the
+	// prove phase's review round runs as a read-only delegated CLI: ""
+	// or "native" (stored as "") keeps the native reviewer, anything
+	// else must name a registered harness. No settings default.
+	ReviewHarness string `json:"review_harness"`
 	// Environment selects the per-language sandbox image (D-05x) a
 	// coding mission's container runs: "" auto-detects from the repo at
 	// provisioning (falling back to base), a registered key forces that
@@ -492,64 +492,35 @@ type createMissionRequest struct {
 	// ConnectorID names a github-kind connectors row whose PAT
 	// authenticates the clone; only meaningful alongside RepoURL.
 	ConnectorID string `json:"connector_id"`
-	// OnComplete is the operator's consent-at-create choice for what
-	// happens when this mission reaches done: "" (default), "push", or
-	// "push_pr". Requires RepoURL+ConnectorID (a github-connection
-	// mission) and kind=coding — a model never decides this, only the
-	// human choosing it here. Normalized into a "github" Destinations
-	// entry by destinationEntries below (issue #480).
-	OnComplete string `json:"on_complete"`
-	// BranchPattern/CommitStyle override the settings-configured git
-	// strategy defaults for this mission alone; "" (the default) applies
-	// the settings default at provisioning/commit time. Validated the
-	// same way settings.Store.SetValue validates the global default —
-	// only known placeholders/styles, never model-decided. Folded into
-	// the same "github" Destinations entry as OnComplete.
-	BranchPattern string `json:"branch_pattern"`
-	CommitStyle   string `json:"commit_style"`
-	// CreateIfMissing (issue #483) opts the github destination entry
-	// into create-if-missing delivery (missions.DestinationEntry's own
-	// field): false (the default) never creates a repo, matching every
-	// pre-#483 request. Only meaningful alongside OnComplete; folded
-	// into the same "github" Destinations entry destinationEntries
-	// below builds. No flat-field precedent to mirror (issue #480's
-	// columns predate create-if-missing entirely), so this is new
-	// surface, not a compat shim.
-	CreateIfMissing bool `json:"create_if_missing"`
-	// DestinationConnectorID/DestinationRepoURL (issue #483) name the
-	// github destination entry's OWN push target, distinct from
-	// RepoURL/ConnectorID above (the mission's clone SOURCE): a scratch
-	// mission (RepoURL empty, self-init'd worktree) can still push
-	// somewhere via CreateIfMissing, and even a cloned mission can push
-	// to a different repo than it cloned from. DestinationRepoURL empty
-	// with CreateIfMissing=true derives a repo name from the mission's
-	// goal at delivery time (destinations.GitHubAdapter);
-	// DestinationConnectorID empty falls back to ConnectorID (the same
-	// connector authenticates both clone and push, the common case).
-	DestinationConnectorID string `json:"destination_connector_id"`
-	DestinationRepoURL     string `json:"destination_repo_url"`
 	// ParentMissionID, when set, makes this a follow-up mission: the
 	// named mission must already be terminal (done/failed). Its
 	// outcome digest (missions.OutcomeDigest) is snapshotted onto this
 	// mission's ParentContext at create time, and its branch, when
 	// reachable, becomes this mission's worktree base.
 	ParentMissionID string `json:"parent_mission_id"`
-	// Attachments name already-uploaded PDF documents (POST
-	// /v1/attachments) to attach at create time — PDF-only, converted
-	// to markdown once here (see resolveAttachments); images/audio are
-	// unsupported for missions.
+	// Attachments name already-uploaded documents, images, or audio
+	// clips (POST /v1/attachments) to attach at create time: converted
+	// once here into markdown/caption/transcript (issue #359, see
+	// attachmentResolver.Resolve).
 	Attachments []missionAttachmentInput `json:"attachments"`
 	// References names composer #-mention picks (missions/sessions/kb
 	// docs) to resolve at create time into ReferencedContext, additive
 	// to and distinct from ParentMissionID's own single-parent lineage.
 	References []chat.Reference `json:"references"`
 	// DestinationIDs names operator-created destinations (email,
-	// webhook) to deliver this mission's outcome digest to on the
-	// terminal done transition — every id is validated to exist AND be
-	// enabled at create time (missions.ValidateCreate); the model never
-	// supplies or addresses a destination (D-061). Normalized into bare
-	// Destinations entries by destinationEntries below (issue #480).
+	// webhook, telegram, github) to deliver this mission's outcome to on
+	// the terminal done transition, every id validated to exist AND
+	// be enabled at create time (missions.ValidateCreate); the model
+	// never supplies or addresses a destination (D-061). Normalized into
+	// bare Destinations entries by destinationEntries below (issue #480).
 	DestinationIDs []string `json:"destination_ids"`
+	// DestinationRepoURLs (issue #561) sets a github destination id's
+	// target repository: destination id -> https clone URL. "" or an
+	// id absent from the map falls back to the mission's own clone
+	// source (or, when the destination's config allows it, a repo
+	// created at delivery time). An id present here but not in
+	// DestinationIDs is rejected as a 400 (create() below).
+	DestinationRepoURLs map[string]string `json:"destination_repo_urls"`
 	// PromoteKBCollectionID (D-081, issue #370) names a kb collection to
 	// promote this mission's markdown artifacts into on the terminal
 	// done transition: "" (default) promotes nothing automatically;
@@ -586,32 +557,42 @@ type createMissionRequest struct {
 	PermissionTimeoutSeconds *int `json:"permission_timeout_seconds"`
 }
 
-// destinationEntries normalizes the request's separate DestinationIDs/
-// PromoteKBCollectionID/OnComplete/BranchPattern/CommitStyle/
-// CreateIfMissing fields into missions.Mission's single Destinations
-// slice (issue #480, extended #483): one bare entry per destination
-// id, one "kb" entry when PromoteKBCollectionID is set, one "github"
-// entry when OnComplete, BranchPattern, CommitStyle, or
-// CreateIfMissing is set. The wire request shape is unchanged; only
-// the internal Mission representation moved.
+// destinationEntries normalizes the request's DestinationIDs/
+// DestinationRepoURLs/PromoteKBCollectionID fields into
+// missions.Mission's single Destinations slice (issue #480, #561): one
+// bare entry per destination id (RepoURL set from DestinationRepoURLs
+// when present), plus one "kb" entry when PromoteKBCollectionID is
+// set. The wire request shape is unchanged; only the internal Mission
+// representation moved.
 func (r createMissionRequest) destinationEntries() []missions.DestinationEntry {
 	var entries []missions.DestinationEntry
 	for _, id := range r.DestinationIDs {
-		entries = append(entries, missions.DestinationEntry{DestinationID: id})
+		entries = append(entries, missions.DestinationEntry{DestinationID: id, RepoURL: r.DestinationRepoURLs[id]})
 	}
 	if r.PromoteKBCollectionID != "" {
 		entries = append(entries, missions.DestinationEntry{Destination: missions.DestinationKindKB, CollectionID: r.PromoteKBCollectionID})
 	}
-	if r.OnComplete != "" || r.BranchPattern != "" || r.CommitStyle != "" || r.CreateIfMissing {
-		entries = append(entries, missions.DestinationEntry{
-			Destination: missions.DestinationKindGitHub, Mode: r.OnComplete,
-			BranchPattern: r.BranchPattern, CommitStyle: r.CommitStyle,
-			CreateIfMissing: r.CreateIfMissing,
-			ConnectorID:     r.DestinationConnectorID,
-			RepoURL:         r.DestinationRepoURL,
-		})
-	}
 	return entries
+}
+
+// unknownDestinationRepoURLIDs reports every DestinationRepoURLs key
+// not present in DestinationIDs, a 400 rather than a silently
+// dropped repo_url override.
+func (r createMissionRequest) unknownDestinationRepoURLIDs() []string {
+	if len(r.DestinationRepoURLs) == 0 {
+		return nil
+	}
+	known := make(map[string]bool, len(r.DestinationIDs))
+	for _, id := range r.DestinationIDs {
+		known[id] = true
+	}
+	var unknown []string
+	for id := range r.DestinationRepoURLs {
+		if !known[id] {
+			unknown = append(unknown, id)
+		}
+	}
+	return unknown
 }
 
 // missionAttachmentInput names one already-uploaded attachment to
@@ -636,11 +617,18 @@ func (h *missionAPI) create(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "bad_request", "goal is required")
 		return
 	}
+	if unknown := req.unknownDestinationRepoURLIDs(); len(unknown) > 0 {
+		jsonError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("destination_repo_urls names id(s) not in destination_ids: %s", strings.Join(unknown, ", ")))
+		return
+	}
 	if req.Kind == "" {
 		req.Kind = classifyKind(r.Context(), h.classify, req.Goal)
 	}
 	if req.Harness == "native" {
 		req.Harness = ""
+	}
+	if req.ReviewHarness == "native" {
+		req.ReviewHarness = ""
 	}
 	// codingExecutorDefault/environment auto-detect are HTTP-request-time
 	// resolution seams (settings lookup, goal-keyword heuristic) with no
@@ -702,8 +690,9 @@ func (h *missionAPI) create(w http.ResponseWriter, r *http.Request) {
 			Digest: missions.OutcomeDigest(parent, events, parent.Phase, parent.FailureReason),
 		}
 	}
-	pdfSources, ok := h.resolveAttachments(w, r.Context(), req.Attachments)
-	if !ok {
+	pdfSources, err := h.attachments.Resolve(r.Context(), req.Attachments)
+	if err != nil {
+		jsonError(w, attachmentErrorStatus(err), "bad_request", err.Error())
 		return
 	}
 	refSources, err := h.resolveReferenceSources(r.Context(), req.References)
@@ -815,6 +804,7 @@ func (h *missionAPI) create(w http.ResponseWriter, r *http.Request) {
 		RouteModel: req.RouteModel, PlanRouteModel: req.PlanRouteModel, ReviewRouteModel: req.ReviewRouteModel,
 		MaxIterations: req.MaxIterations, BudgetAmount: req.BudgetAmount, BudgetCurrency: budgetCurrency,
 		AutoApproveTools: autoApproveTools, AutoApprovePlan: autoApprovePlan, PromptOverlay: promptOverlay, Harness: req.Harness, Environment: req.Environment,
+		ReviewHarness:            req.ReviewHarness,
 		HasPlan:                  req.HasPlan,
 		ParentMissionID:          parentMissionID,
 		Sources:                  sources,
@@ -1005,80 +995,6 @@ func (h *missionAPI) resolveReferenceSources(ctx context.Context, refs []chat.Re
 	return out, nil
 }
 
-// resolveAttachments validates and converts a create request's PDF and
-// text refs into "pdf" SourceEntry values -- writes any error response
-// itself and returns ok=false, mirroring chat.validateAttachments'
-// shape but as a method so it can write directly (create()'s other
-// validation blocks use jsonError+return rather than a returned
-// error). Empty input returns nil, true without touching the store,
-// same as chat's own zero-ids fast path.
-func (h *missionAPI) resolveAttachments(w http.ResponseWriter, ctx context.Context, in []missionAttachmentInput) ([]missions.SourceEntry, bool) {
-	if len(in) == 0 {
-		return nil, true
-	}
-	if h.attachments == nil {
-		jsonError(w, http.StatusBadRequest, "bad_request", "attachments are not enabled")
-		return nil, false
-	}
-	if len(in) > maxMissionAttachments {
-		jsonError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("too many attachments (max %d)", maxMissionAttachments))
-		return nil, false
-	}
-	// Fetch and validate mime up front so the markitdown-sidecar check
-	// below only fires when a PDF actually needs conversion — text
-	// attachments must succeed with no sidecar configured.
-	atts := make([]attachments.Attachment, len(in))
-	needsMarkitdown := false
-	for i, input := range in {
-		att, err := h.attachments.Get(ctx, input.ID)
-		if err != nil {
-			jsonError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("attachment %q not found", input.ID))
-			return nil, false
-		}
-		if att.Mime != "application/pdf" && att.Mime != "text/plain" {
-			jsonError(w, http.StatusBadRequest, "bad_request", "only document attachments are supported for missions")
-			return nil, false
-		}
-		if att.Mime == "application/pdf" {
-			needsMarkitdown = true
-		}
-		atts[i] = att
-	}
-	if needsMarkitdown && h.markitdownURL == "" {
-		jsonError(w, http.StatusBadRequest, "bad_request", "pdf attachments require the markitdown sidecar (MARKITDOWN_URL)")
-		return nil, false
-	}
-	out := make([]missions.SourceEntry, 0, len(in))
-	for i, input := range in {
-		att := atts[i]
-		r, _, err := h.attachments.Open(ctx, att.ID)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "internal_error", err.Error())
-			return nil, false
-		}
-		raw, err := io.ReadAll(r)
-		_ = r.Close()
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "internal_error", err.Error())
-			return nil, false
-		}
-		var md string
-		if att.Mime == "application/pdf" {
-			md, err = markitdown.Convert(ctx, h.markitdownHTTP, h.markitdownURL, att.ID+".pdf", att.Mime, raw)
-			if err != nil {
-				jsonError(w, http.StatusInternalServerError, "internal_error", err.Error())
-				return nil, false
-			}
-		} else {
-			md = string(raw)
-		}
-		out = append(out, missions.SourceEntry{
-			Source: missions.SourceKindPDF, ID: att.ID, Mime: att.Mime, Name: input.Name, Markdown: markitdown.TruncateMarkdown(md),
-		})
-	}
-	return out, true
-}
-
 // generateName fires the mission's one-shot naming call in the
 // background — never blocks or fails create, mirrors chat.autoTitle's
 // fire-and-forget shape exactly. Since issue #494 the driver names a
@@ -1260,43 +1176,6 @@ func (h *missionAPI) classifyGoal(w http.ResponseWriter, r *http.Request) {
 	kind, light := classifyKindAndLight(r.Context(), h.classify, req.Goal)
 	hasPlan := classifyHasPlan(req.Goal)
 	writeJSON(w, http.StatusOK, map[string]any{"kind": kind, "light": light, "has_plan": hasPlan})
-}
-
-// detectDestination serves POST /v1/missions/detect-destination
-// (issue #483): an on-demand "Detect from goal" action the create
-// form calls explicitly, never fired automatically, so a proposal is
-// always something the operator saw before it could ever end up on
-// the create request. chat.ExtractGitHubDestinationOverGateway's
-// never-errors contract means this 200s with found=false rather than
-// erroring on any gateway failure/ambiguity -- there is nothing the
-// caller needs to distinguish from "genuinely nothing detected."
-func (h *missionAPI) detectDestination(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Goal string `json:"goal"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if req.Goal == "" {
-		jsonError(w, http.StatusBadRequest, "bad_request", "goal is required")
-		return
-	}
-	if h.extractGitHubDestination == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"found": false})
-		return
-	}
-	p := h.extractGitHubDestination(r.Context(), req.Goal)
-	if !p.Found {
-		writeJSON(w, http.StatusOK, map[string]any{"found": false})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"found": true,
-		"owner": p.Owner,
-		"repo":  p.Repo,
-		"mode":  p.Mode,
-	})
 }
 
 // executorOption is one registered harness's live pairing preview for
@@ -2147,7 +2026,7 @@ func (h *missionAPI) promoteKB(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "no_artifacts", "mission has no artifacts to promote")
 		return
 	}
-	promoted, errs := destinations.PromoteMission(r.Context(), h.attachments, h.kbStore, h.kbIngest, h.kbEnrich, m, body.CollectionID)
+	promoted, errs := destinations.PromoteMission(r.Context(), h.rawAttachments, h.kbStore, h.kbIngest, h.kbEnrich, m, body.CollectionID)
 	if promoted == 0 {
 		msg := "no markdown artifacts were promoted"
 		if len(errs) > 0 {

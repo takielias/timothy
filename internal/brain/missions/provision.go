@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/SumonMSelim/timothy/internal/brain/tools"
 )
@@ -22,6 +23,15 @@ type provisioner struct {
 	sessions  sessionCreator
 	perms     sessionGranter
 	log       *slog.Logger
+
+	// provisionMu guards provisionLocks, a per-mission lock so a second
+	// caller (issue #569: the work-slot sweep claiming a row Create is
+	// still cloning into) waits for the first ensureProvisioned instead of
+	// racing it into a second clone. Entries are never removed: missions
+	// are finite per process lifetime, so the map stays bounded by however
+	// many distinct missions this process has provisioned.
+	provisionMu    sync.Mutex
+	provisionLocks map[string]*sync.Mutex
 
 	// resolveAgent resolves a mission's agent_id to its
 	// ApprovalAllowlist at provisioning time (see SetAgentResolver) —
@@ -47,12 +57,19 @@ type provisioner struct {
 
 	// gitBranchPattern resolves the settings-configured default branch
 	// pattern (see SetGitBranchPattern) — consulted by ensureProvisioned
-	// only when the mission's own github destination entry has no
-	// BranchPattern (mission override > settings > worktree.go's
+	// only when no github destination entry's own policy sets one
+	// (destination override > settings > worktree.go's
 	// DefaultBranchPattern). nil-safe: unset falls straight through to
 	// Provision's own DefaultBranchPattern fallback, same as before this
 	// setting existed.
 	gitBranchPattern func(ctx context.Context) string
+
+	// resolveGitHubPolicy wires GitHubPolicyResolver (see
+	// Driver.SetGitHubPolicyResolver): resolves a mission's github
+	// destination entries' saved branch pattern, consulted before
+	// gitBranchPattern above. nil-safe: unset means every mission falls
+	// straight through to settings.
+	resolveGitHubPolicy GitHubPolicyResolver
 
 	// resolvePRState resolves whether a github PR has been merged (see
 	// SetPRStateResolver) — consulted by followUpBaseRef when the parent
@@ -110,7 +127,40 @@ func (p *provisioner) nameBeforeBranch(ctx context.Context, m Mission) Mission {
 	return m
 }
 
+// missionLock returns the mutex guarding mission id's provisioning,
+// creating one on first use.
+func (p *provisioner) missionLock(id string) *sync.Mutex {
+	p.provisionMu.Lock()
+	defer p.provisionMu.Unlock()
+	if p.provisionLocks == nil {
+		p.provisionLocks = map[string]*sync.Mutex{}
+	}
+	mu, ok := p.provisionLocks[id]
+	if !ok {
+		mu = &sync.Mutex{}
+		p.provisionLocks[id] = mu
+	}
+	return mu
+}
+
+// ensureProvisioned serializes concurrent callers for the same mission
+// id (issue #569: Create's inline provisioning and the work-slot
+// sweep's Advance can both reach this for a mission still mid-clone).
+// The second caller waits, then re-reads the row so it sees the first
+// caller's finished work instead of provisioning again.
 func (p *provisioner) ensureProvisioned(ctx context.Context, m Mission) (Mission, error) {
+	mu := p.missionLock(m.ID)
+	mu.Lock()
+	defer mu.Unlock()
+	if fresh, err := p.store.Get(ctx, m.ID); err != nil {
+		p.log.Warn("driver: ensureProvisioned: re-read failed, using passed-in mission", "mission_id", m.ID, "error", err)
+	} else {
+		m = fresh
+	}
+	return p.ensureProvisionedLocked(ctx, m)
+}
+
+func (p *provisioner) ensureProvisionedLocked(ctx context.Context, m Mission) (Mission, error) {
 	if m.SessionID == "" && p.sessions != nil {
 		sessionID, err := p.sessions.Create(ctx, "")
 		if err != nil {
@@ -149,13 +199,7 @@ func (p *provisioner) ensureProvisioned(ctx context.Context, m Mission) (Mission
 				}
 			}
 		}
-		branchPattern := ""
-		if e, ok := m.GitHubEntry(); ok {
-			branchPattern = e.BranchPattern
-		}
-		if branchPattern == "" && p.gitBranchPattern != nil {
-			branchPattern = p.gitBranchPattern(ctx)
-		}
+		branchPattern := p.githubBranchPattern(ctx, m)
 		baseRef := p.followUpBaseRef(ctx, m)
 		m = p.nameBeforeBranch(ctx, m)
 		workspace, worktree, branch, baseCommit, baseUsed, err := p.workspace.Provision(ctx, m.ID, m.Goal, m.Name, m.Kind, repoURL, token, connIdentity, branchPattern, baseRef)
@@ -205,6 +249,33 @@ func (p *provisioner) ensureProvisioned(ctx context.Context, m Mission) (Mission
 		}
 	}
 	return m, nil
+}
+
+// githubBranchPattern resolves the precedence a mission's github
+// destination entries (in order, first ok=true wins) > settings
+// default > "" (Provision's own DefaultBranchPattern fallback), a
+// resolver error is logged and treated as "no override," never fails
+// provisioning.
+func (p *provisioner) githubBranchPattern(ctx context.Context, m Mission) string {
+	if p.resolveGitHubPolicy != nil {
+		for _, e := range m.Destinations {
+			if e.DestinationID == "" {
+				continue
+			}
+			policy, ok, err := p.resolveGitHubPolicy(ctx, e.DestinationID)
+			if err != nil {
+				p.log.Warn("driver: resolve github policy failed", "mission_id", m.ID, "destination_id", e.DestinationID, "error", err)
+				continue
+			}
+			if ok && policy.BranchPattern != "" {
+				return policy.BranchPattern
+			}
+		}
+	}
+	if p.gitBranchPattern != nil {
+		return p.gitBranchPattern(ctx)
+	}
+	return ""
 }
 
 // followUpBaseRef resolves a follow-up mission's worktree base: the

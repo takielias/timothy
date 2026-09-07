@@ -262,6 +262,30 @@ describe('executor lifecycle event rendering', () => {
     expect(screen.getByText('harness')).toBeInTheDocument()
   })
 
+  it('renders a prove-phase executor.spawned as a delegated review (issue #582)', () => {
+    render(
+      <div>
+        {renderEvent(
+          event(
+            { harness: 'pi', provider: 'anthropic', model: 'sonnet', auth_mode: 'api_key', run_id: 'r2', phase: 'prove' },
+            'executor.spawned',
+          ),
+        )}
+      </div>,
+    )
+    expect(screen.getByText(/Review delegated to pi/)).toBeInTheDocument()
+  })
+
+  it('renders review.delegated_fallback with the harness and reason (issue #582)', () => {
+    render(
+      <div>
+        {renderEvent(event({ harness: 'cursor-cli', reason: 'refused', error: 'read-only mode not supported' }, 'review.delegated_fallback'))}
+      </div>,
+    )
+    expect(screen.getByText(/Review harness cursor-cli unavailable \(refused\), native review ran instead/)).toBeInTheDocument()
+    expect(screen.getByText(/read-only mode not supported/)).toBeInTheDocument()
+  })
+
   it('renders executor.died as an error row', () => {
     render(<div>{renderEvent(event({ reason: 'oom' }, 'executor.died'))}</div>)
     expect(screen.getByText(/Harness died: oom/)).toBeInTheDocument()
@@ -323,6 +347,13 @@ describe('executor lifecycle event rendering', () => {
     )
     expect(screen.getByText(/Harness skipped: no_usable_entry/)).toBeInTheDocument()
     expect(screen.getByText(/no credential configured/)).toBeInTheDocument()
+  })
+
+  it('renders executor.steered with the harness and delivered note', () => {
+    render(<div>{renderEvent(event({ note: 'focus on staging next', harness: 'pi' }, 'executor.steered'))}</div>)
+    const row = screen.getByText(/Steering note delivered to the running pi agent: focus on staging next/)
+    expect(row).toBeInTheDocument()
+    expect(row).toHaveClass('text-amber-400')
   })
 })
 
@@ -428,17 +459,12 @@ describe('mission.discover_complete / mission.explore_complete rendering', () =>
 describe('mission.result_complete rendering', () => {
   it('renders a successful result step summary', () => {
     render(
-      <div>
-        {renderEvent(
-          event({ delivered: 2, artifacts_copied: 1, on_complete: 'push' }, 'mission.result_complete'),
-        )}
-      </div>,
+      <div>{renderEvent(event({ delivered: 2, artifacts_copied: 1 }, 'mission.result_complete'))}</div>,
     )
     const row = screen.getByText(/Result complete/)
     expect(row).toHaveClass('text-green-400')
     expect(row).toHaveTextContent('delivered to 2')
     expect(row).toHaveTextContent('1 artifact(s) copied')
-    expect(row).toHaveTextContent('push')
   })
 
   it('renders a failed result step in red', () => {

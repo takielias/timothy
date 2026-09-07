@@ -291,11 +291,16 @@ func main() {
 	// below) can close over the same store the kb admin API and mission
 	// promotion hook use later in this function.
 	kbStore := kb.New(app.DB)
+	// captionImage converts an image's bytes into a plain-prose
+	// description: built once and shared by the KB enricher below and
+	// mission/schedule attachment resolution (issue #359) so both draw
+	// on the same vision-route mechanism.
+	captionImage := chat.CaptionImageOverGateway(gwc, app.Log)
 	// KB image captioning (issues #349/#350): default-off, gated on
 	// settings.KeyKBImageCaptioning; shared by the manual ingest funnel,
 	// the retry sweep, and mission promotion so none of the three diverge
 	// on what "captioned" means.
-	kbEnrich := api.NewKBEnricher(chat.CaptionImageOverGateway(gwc, app.Log), func(ctx context.Context) bool {
+	kbEnrich := api.NewKBEnricher(captionImage, func(ctx context.Context) bool {
 		return flags.Enabled(ctx, settings.KeyKBImageCaptioning)
 	}, app.Log)
 	missionStore, missionDriver, missionNotifier, missionWorkspace, missionHub, missionScheduler := buildMissions(ctx, app.DB, agent, store, workspace, flags, missionSandbox, agentReg, routeForRole, fxStore, gwc, secrets, conns, mc, packs, app.Log)
@@ -303,11 +308,10 @@ func main() {
 		go missions.RecoverAndSweep(ctx, missionDriver, missionStore, missionWorkSlotMax, missionSandbox, missionSandbox, missionNotifier, gwc,
 			flags.PermissionTimeoutSeconds, flags.AskTimeoutSeconds, broker.Resolve, app.Log)
 	}
-	// The push/PR adapter (issue #560): built once here so both the
-	// driver's auto-fire-on-done hook (legacy self-describing github
-	// entry) and the Deliverer (saved github destination kind) share the
-	// exact same push/PR code. nil workspace/store (missions disabled)
-	// still builds one; ResolveToken/PR nil-gate its actual use.
+	// The push/PR adapter (issue #560): built once here so the Deliverer
+	// (saved github destination kind) always has the same push/PR code
+	// the manual push/pr API endpoints use. nil workspace/store (missions
+	// disabled) still builds one; ResolveToken/PR nil-gate its actual use.
 	var githubAdapter *destinations.GitHubAdapter
 	if missionDriver != nil {
 		var resolveGitHubToken destinations.PushTokenResolver
@@ -323,7 +327,6 @@ func main() {
 			githubPR = connsPRSource{conns}
 		}
 		githubAdapter = destinations.NewGitHubAdapter(missionWorkspace, missionStore, resolveGitHubToken, githubPR)
-		missionDriver.SetCompleter(githubAdapter)
 	}
 	destinationStore, destinationDeliverer := buildDestinations(app.DB, conns, goog, secrets, flags, missionStore, githubAdapter, app.Log)
 	if missionDriver != nil && destinationDeliverer != nil {
@@ -331,6 +334,9 @@ func main() {
 	}
 	if missionScheduler != nil && destinationStore != nil {
 		missionScheduler.SetDestinationEnabled(destinationStore.EnabledByID)
+	}
+	if missionDriver != nil && destinationStore != nil {
+		missionDriver.SetGitHubPolicyResolver(destinationStore.GitHubPolicy)
 	}
 	if missionDriver != nil {
 		// D-071: close the unvalidated Driver.Create path (the workflows
@@ -346,7 +352,7 @@ func main() {
 			},
 		}
 		if destinationStore != nil {
-			deps.DestinationEnabled = destinationStore.EnabledByID
+			deps.DestinationKind = destinationStore.KindByID
 		}
 		deps.KBCollectionExists = func(ctx context.Context, id string) (bool, error) {
 			if _, err := kbStore.GetCollection(ctx, id); err != nil {
@@ -759,7 +765,7 @@ func main() {
 	api.Register(app.Server, svc, store, broker,
 		memoryProxy(memorydURL, app.Log), adminProxy(gatewayURL, usageDecorator.Decorate, app.Log), flags, fxStore,
 		agentReg, conns, goog, msft, secrets, agent, packs, missionStore, missionDriver, missionNotifier,
-		missionWorkspace, resolveSecret, routeForRole, chat.ClassifyOverGateway(gwc), gwc.ResolveRoute, chat.TitleOverGateway(gwc, app.Log), ledgerAgg.TopModelByMission, missionHub, attachmentStore, &http.Client{}, whisperURL, markitdownURL, token, app.Log, gwc, kbStore, mc, chat.ClassifyCollectionOverGateway(gwc, app.Log), chat.TitleOverGateway(gwc, app.Log), kbEnrich, destinationStore, destinationTest, workflowStore, workflowEngine, pdfService, chat.ExtractGitHubDestinationOverGateway(gwc, app.Log))
+		missionWorkspace, resolveSecret, routeForRole, chat.ClassifyOverGateway(gwc), gwc.ResolveRoute, chat.TitleOverGateway(gwc, app.Log), ledgerAgg.TopModelByMission, missionHub, attachmentStore, &http.Client{}, whisperURL, markitdownURL, token, app.Log, gwc, kbStore, mc, chat.ClassifyCollectionOverGateway(gwc, app.Log), chat.TitleOverGateway(gwc, app.Log), kbEnrich, destinationStore, destinationTest, workflowStore, workflowEngine, pdfService, captionImage)
 
 	if err := app.Run(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		app.Log.Error("server exited", "error", err)
@@ -1179,14 +1185,6 @@ func buildMissions(ctx context.Context, db *pgpool.Pool, agent *loop.Agent, sess
 			return conns.PRMerged(ctx, connectorID, owner, repo, number)
 		})
 	}
-	if conns != nil && secrets != nil {
-		driver.SetPushFailedNotifier(func(ctx context.Context, missionID, message string) {
-			if err := notifier.NotifyMessage(ctx, missionID, "push_failed", message); err != nil {
-				log.Warn("driver: on_complete push_failed notification failed", "mission_id", missionID, "error", err)
-			}
-		})
-	}
-
 	schedulerEnabled := func(ctx context.Context) bool { return flags.Enabled(ctx, settings.KeyScheduler) }
 	// routeExists backs DefaultCodingRoute's preference check for a
 	// coding template's route (see api/missions.go's own copy of this
@@ -1271,7 +1269,6 @@ func toMissionRecord(m missions.Mission) builtin.MissionRecord {
 		CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
 		UnitsPassed: passed, UnitsTotal: len(m.Plan.Units),
 		PauseReason: string(m.PauseReason), PauseMessage: m.PauseMessage,
-		OnComplete:        m.OnComplete(),
 		NotPushableReason: missions.NotPushable(m),
 	}
 }
@@ -1385,7 +1382,16 @@ func buildDelegatedRunner(native missions.Runner, store *missions.Store, gwc *gw
 		}
 	}
 	led := ledger.New(db, log, nil)
-	return missions.NewDelegatedRunner(native, gwc.ResolveRoute, resolveCred, sandboxMgr.ExecEnv, store, store.LastRunState, led, flags.ExecutorRunBudget, log)
+	runner := missions.NewDelegatedRunner(native, gwc.ResolveRoute, resolveCred, sandboxMgr.ExecEnv, store, store.LastRunState, led, flags.ExecutorRunBudget, log)
+	// issue #358: wires mid-run steering delivery for a Steerer
+	// adapter (pi), same setter/wiring pattern as nativeRunner's own
+	// SetProgressReader a few lines up in buildMissions.
+	if withSteering, ok := runner.(interface {
+		SetProgressReader(missions.ProgressReader)
+	}); ok {
+		withSteering.SetProgressReader(store)
+	}
+	return runner
 }
 
 // memoryProxy forwards the web's memory-management routes to memoryd

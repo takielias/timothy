@@ -6,6 +6,8 @@ import type {
   ExecutorResultPayload,
   ExecutorSkippedPayload,
   ExecutorSpawnedPayload,
+  ExecutorSteeredPayload,
+  ReviewDelegatedFallbackPayload,
   MissionEvent,
   MissionPermissionDeniedPayload,
   MissionPROpenedPayload,
@@ -261,23 +263,15 @@ const renderers: Record<string, (payload: unknown) => ReactNode> = {
     return `Discover complete (${String(chars ?? '?')} chars)`
   },
   // mission.result_complete is the result phase's own step outcome
-  // (D-086): a summary of what delivery/copy/promote/on_complete did.
+  // (D-086): a summary of what delivery/copy/promote did.
   'mission.result_complete': (p) => {
-    const {
-      delivered,
-      artifacts_copied,
-      promoted_kb_collection_id,
-      on_complete,
-      delivery_error,
-      promote_kb_error,
-      on_complete_error,
-    } = asRecord(p)
+    const { delivered, artifacts_copied, promoted_kb_collection_id, delivery_error, promote_kb_error } =
+      asRecord(p)
     const parts: string[] = []
     if (delivered) parts.push(`delivered to ${String(delivered)}`)
     if (artifacts_copied) parts.push(`${String(artifacts_copied)} artifact(s) copied`)
     if (promoted_kb_collection_id) parts.push('promoted to kb')
-    if (on_complete) parts.push(String(on_complete))
-    const errors = [delivery_error, promote_kb_error, on_complete_error].filter(Boolean)
+    const errors = [delivery_error, promote_kb_error].filter(Boolean)
     if (errors.length === 0) {
       return <span className="text-green-400">Result complete{parts.length > 0 ? `: ${parts.join(', ')}` : ''}</span>
     }
@@ -288,10 +282,10 @@ const renderers: Record<string, (payload: unknown) => ReactNode> = {
     )
   },
   'executor.spawned': (p) => {
-    const { harness, provider, model, auth_mode } = p as ExecutorSpawnedPayload
+    const { harness, provider, model, auth_mode, phase } = p as ExecutorSpawnedPayload
     return (
       <span>
-        Delegated to {harness} ·{' '}
+        {phase === 'prove' ? 'Review delegated to' : 'Delegated to'} {harness} ·{' '}
         <span className="font-mono">
           {provider}/{model}
         </span>{' '}
@@ -329,6 +323,28 @@ const renderers: Record<string, (payload: unknown) => ReactNode> = {
         {reason === 'no_usable_entry' && skip_reasons && skip_reasons.length > 0
           ? ` — ${skip_reasons.join(', ')}`
           : ''}
+      </span>
+    )
+  },
+  // review.delegated_fallback (issue #582): the mission's review_harness
+  // could not serve the round, so the native reviewer ran instead.
+  'review.delegated_fallback': (p) => {
+    const { harness, reason, error } = p as ReviewDelegatedFallbackPayload
+    return (
+      <span className="text-amber-400">
+        Review harness {harness} unavailable ({reason}), native review ran instead
+        {error ? `: ${truncateForDisplay(error)}` : ''}
+      </span>
+    )
+  },
+  // executor.steered (issue #358): an operator note actually delivered
+  // to the running harness process mid-turn, distinct from
+  // mission.steered (the note's own posting, fires for every harness).
+  'executor.steered': (p) => {
+    const { note, harness } = p as ExecutorSteeredPayload
+    return (
+      <span className="text-amber-400">
+        Steering note delivered to the running {harness} agent: {note}
       </span>
     )
   },

@@ -460,6 +460,38 @@ func TestRenderReviewContentFindingsOnlyEmptyDelta(t *testing.T) {
 	}
 }
 
+// TestRenderReviewContentFullPinsOlderOperatorNote covers issue #357: a
+// full review round must not drop an operator steering note older than
+// progressRenderCap notes.
+func TestRenderReviewContentFullPinsOlderOperatorNote(t *testing.T) {
+	notes := []ProgressNote{{Note: operatorNotePrefix + "focus on error handling"}}
+	for i := 0; i < progressRenderCap; i++ {
+		notes = append(notes, ProgressNote{Note: fmt.Sprintf("progress %d", i)})
+	}
+	content := renderReviewContent(ReviewPacket{Goal: "goal", Progress: notes})
+	if !strings.Contains(content, operatorNotePrefix+"focus on error handling") {
+		t.Fatalf("full-round content dropped an operator note older than progressRenderCap:\n%s", content)
+	}
+	if !strings.Contains(content, "progress 0") || !strings.Contains(content, fmt.Sprintf("progress %d", progressRenderCap-1)) {
+		t.Fatalf("full-round content missing recent notes:\n%s", content)
+	}
+}
+
+// TestRenderReviewContentFindingsOnlyDoesNotPinOlderOperatorNote confirms
+// the findings-only branch keeps its existing behavior: it renders only
+// notes since the last review round and never pins an older operator
+// note (D-096's window is intentionally narrow).
+func TestRenderReviewContentFindingsOnlyDoesNotPinOlderOperatorNote(t *testing.T) {
+	notes := []ProgressNote{{Note: operatorNotePrefix + "focus on error handling"}}
+	for i := 0; i < progressRenderCap; i++ {
+		notes = append(notes, ProgressNote{Note: fmt.Sprintf("progress %d", i)})
+	}
+	content := renderReviewContent(ReviewPacket{FindingsOnly: true, Progress: notes})
+	if strings.Contains(content, operatorNotePrefix+"focus on error handling") {
+		t.Fatalf("findings-only content must not pin an older operator note:\n%s", content)
+	}
+}
+
 // TestRenderReviewContentMultiUnitFiles pins D-098's attribution in a
 // full round over several units: each unit block lists the changed
 // files inside its own scope, the whole-change stat is labelled as
@@ -1042,6 +1074,65 @@ func TestPlanSessionRejectsBackticks(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "command substitution") {
 		t.Fatalf("PlanSession error = %q, want it to name command substitution", err.Error())
+	}
+}
+
+// TestPlanSessionRejectsGitStatusVerifyCmd guards issue #567: the
+// harness commits every unit's files itself after the worker turn, so
+// a verify_cmd asserting on git status always checks a stale
+// assumption about working-tree state.
+func TestPlanSessionRejectsGitStatusVerifyCmd(t *testing.T) {
+	agent := &scriptedAgent{batches: [][]stream.StreamEvent{
+		{toolEndEvent(planToolName, `{"units":[{"title":"Add smoke file","artifacts":["out.md"],"criteria":["c1","c2"],"verify_cmd":"git status --porcelain | grep -qxF '?? out.md'"}]}`)},
+		{toolEndEvent(planToolName, `{"units":[{"title":"Add smoke file","artifacts":["out.md"],"criteria":["c1","c2"],"verify_cmd":"git status --porcelain | grep -qxF '?? out.md'"}]}`)},
+	}}
+	r := newTestRunner(agent)
+	_, err := r.PlanSession(context.Background(), Mission{ID: "m1", Route: "default"}, "")
+	if err == nil {
+		t.Fatal("PlanSession accepted a verify_cmd asserting on git status")
+	}
+	if !strings.Contains(err.Error(), "must not run git") {
+		t.Fatalf("PlanSession error = %q, want it to name the git rejection", err.Error())
+	}
+}
+
+// TestPlanSessionRejectsGitDiffVerifyCmd mirrors the git status case
+// for git diff, another common working-tree-state assertion.
+func TestPlanSessionRejectsGitDiffVerifyCmd(t *testing.T) {
+	agent := &scriptedAgent{batches: [][]stream.StreamEvent{
+		{toolEndEvent(planToolName, `{"units":[{"title":"Add smoke file","artifacts":["out.md"],"criteria":["c1","c2"],"verify_cmd":"git diff --exit-code out.md"}]}`)},
+		{toolEndEvent(planToolName, `{"units":[{"title":"Add smoke file","artifacts":["out.md"],"criteria":["c1","c2"],"verify_cmd":"git diff --exit-code out.md"}]}`)},
+	}}
+	r := newTestRunner(agent)
+	_, err := r.PlanSession(context.Background(), Mission{ID: "m1", Route: "default"}, "")
+	if err == nil {
+		t.Fatal("PlanSession accepted a verify_cmd asserting on git diff")
+	}
+	if !strings.Contains(err.Error(), "must not run git") {
+		t.Fatalf("PlanSession error = %q, want it to name the git rejection", err.Error())
+	}
+}
+
+// TestPlanSessionAcceptsVerifyCmdNotMatchingGitWord confirms the git
+// guard is word-bounded: neither a substring like "digit" nor a path
+// like widget.md false-positives as a git invocation.
+func TestPlanSessionAcceptsVerifyCmdNotMatchingGitWord(t *testing.T) {
+	agent := &scriptedAgent{batches: [][]stream.StreamEvent{
+		{toolEndEvent(planToolName, `{"units":[`+
+			`{"title":"Check digit count","artifacts":["out.md"],"criteria":["c1","c2"],"verify_cmd":"grep -qi '[0-9] digit' out.md"},`+
+			`{"title":"Check widget file","artifacts":["widget.md"],"criteria":["c1","c2"],"verify_cmd":"grep -qi 'ok' widget.md"}`+
+			`]}`)},
+	}}
+	r := newTestRunner(agent)
+	spec, err := r.PlanSession(context.Background(), Mission{ID: "m1", Route: "default", Goal: "fix bug"}, "")
+	if err != nil {
+		t.Fatalf("PlanSession: %v", err)
+	}
+	if len(spec.Units) != 2 {
+		t.Fatalf("PlanSession spec = %+v", spec)
+	}
+	if agent.call != 1 {
+		t.Fatalf("expected exactly one turn (no recovery needed), got %d", agent.call)
 	}
 }
 

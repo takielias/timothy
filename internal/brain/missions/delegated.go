@@ -147,8 +147,9 @@ type cooldownKey struct {
 	harness    string
 }
 
-// delegatedRunner wraps nativeRunner: discover/plan/prove pass through
-// untouched (delegated CLI executors only ever serve worker turns).
+// delegatedRunner wraps nativeRunner: discover/plan pass through
+// untouched; prove passes through unless the mission opted into a
+// delegated reviewer (RunReview, issue #582).
 // RunWorker dispatches on the mission's own Harness column (D-051
 // rework — no longer a per-chain-entry field): m.Harness == "" defers
 // straight to native; otherwise it resolves the worker route on the
@@ -165,6 +166,11 @@ type delegatedRunner struct {
 	events       eventSink
 	lastRun      lastRunStateFunc
 	ledger       usageRecorder
+
+	// progressReader backs mid-run steering delivery to a Steerer
+	// adapter's run (issue #358): mirrors nativeRunner.progressReader,
+	// unset means the feature is off, same nil-safe contract.
+	progressReader ProgressReader
 
 	log *slog.Logger
 
@@ -197,6 +203,14 @@ func NewDelegatedRunner(native Runner, resolveRoute routeResolver, resolveCred c
 	}
 }
 
+// SetProgressReader wires the reader pollToVerdict polls for mid-run
+// operator notes to deliver to a Steerer adapter's run (issue #358):
+// same setter pattern as nativeRunner.SetProgressReader, so
+// cmd/brain/main.go can pass the same *Store both runners share.
+func (r *delegatedRunner) SetProgressReader(pr ProgressReader) {
+	r.progressReader = pr
+}
+
 // effectiveRunBudget is the wall-clock cap for a launch happening now.
 func (r *delegatedRunner) effectiveRunBudget(ctx context.Context) time.Duration {
 	if r.runBudgetFn != nil {
@@ -215,8 +229,209 @@ func (r *delegatedRunner) PlanSession(ctx context.Context, m Mission, discoverNo
 	return r.native.PlanSession(ctx, m, discoverNotes)
 }
 
+// RunReview dispatches on m.ReviewHarness (issue #582): "" defers
+// straight to native.RunReview, byte for byte today's behavior.
+// Otherwise the review round runs as a read-only delegated CLI in the
+// mission's sandbox and worktree, and ANY failure on that path (unknown
+// harness, adapter refusal, unusable route, spawn death, a run without
+// a result, an unparseable verdict) records review.delegated_fallback
+// {harness, reason} and returns the native reviewer's verdict instead:
+// native review is the floor. The driver's own gates (evidence gate,
+// demotion, rounds) run on the returned verdict unchanged either way.
 func (r *delegatedRunner) RunReview(ctx context.Context, m Mission, packet ReviewPacket) (ReviewVerdict, error) {
+	if m.ReviewHarness == "" {
+		return r.native.RunReview(ctx, m, packet)
+	}
+	verdict, reason, err := r.runDelegatedReview(ctx, m, packet)
+	if reason == "" {
+		return verdict, err
+	}
+	if ctx.Err() != nil {
+		// A cancelled driver has no native round to fall back to.
+		return ReviewVerdict{}, ctx.Err()
+	}
+	payload := map[string]any{"harness": m.ReviewHarness, "reason": reason}
+	if err != nil {
+		payload["error"] = truncate(err.Error(), 2000)
+	}
+	r.log.Warn("delegated runner: review harness unusable; falling back to native", "mission_id", m.ID, "harness", m.ReviewHarness, "reason", reason, "error", err)
+	r.recordEventForce(ctx, m.ID, "review.delegated_fallback", payload)
 	return r.native.RunReview(ctx, m, packet)
+}
+
+// Fallback reasons review.delegated_fallback records (issue #582).
+const (
+	fallbackUnknownHarness    = "unknown_harness"
+	fallbackRefused           = "refused"
+	fallbackResolveFailed     = "resolve_failed"
+	fallbackNoUsableEntry     = "no_usable_entry"
+	fallbackCooldown          = "cooldown"
+	fallbackAuthFailed        = "auth_failed"
+	fallbackSpawnFailed       = "spawn_failed"
+	fallbackNoResult          = "no_result"
+	fallbackUnparseableResult = "unparseable_verdict"
+	fallbackPollFailed        = "poll_failed"
+)
+
+// delegatedReviewSystemAppend closes the reviewer's system prompt for a
+// CLI run (issue #582), in place of reviewSystemToolCall: the CLI has no
+// review_verdict tool, its structured result is the verdict channel,
+// and the read-only tool surface the adapter enforces is spelled out so
+// the model does not waste turns trying to edit.
+const delegatedReviewSystemAppend = " You are running as a delegated read-only CLI reviewer, not through a review_verdict tool. You may read files in the working directory to spot-check; you cannot modify files or run commands, so never try. End your turn by producing the required structured output: decision approve or rework, findings (each with title, file, detail, severity and quoted evidence) and the resolved ids of prior findings the work closed."
+
+// runDelegatedReview resolves the review harness, route and entry, runs
+// the review packet through the CLI read-only, and parses its result as
+// the review verdict (issue #582). A non-empty reason means the caller
+// must fall back to native; err carries the detail for the event.
+func (r *delegatedRunner) runDelegatedReview(ctx context.Context, m Mission, packet ReviewPacket) (ReviewVerdict, string, error) {
+	adapter, ok := executor.Lookup(m.ReviewHarness)
+	if !ok {
+		return ReviewVerdict{}, fallbackUnknownHarness, nil
+	}
+	route, err := r.resolveRouteFor(ctx, m, reviewRoute(m), m.ReviewHarness)
+	if err != nil {
+		return ReviewVerdict{}, fallbackResolveFailed, err
+	}
+	if route == nil {
+		return ReviewVerdict{}, fallbackResolveFailed, errors.New("resolved route was nil without an error")
+	}
+	entry, reason := r.pickEntry(route.Entries, m.ReviewHarness, reviewModel(m))
+	if reason != "" {
+		return ReviewVerdict{}, reason, nil
+	}
+	workRoot := m.WorkRoot()
+	authMode, apiKey, err := r.resolveCredential(ctx, entry.CredentialRef, adapter.Capabilities())
+	if err != nil {
+		r.coolDown(m.ReviewHarness, entry)
+		r.recordAuthFailed(ctx, m.ID, string(PhaseProve), m.ReviewHarness)
+		return ReviewVerdict{}, fallbackAuthFailed, err
+	}
+	run := cliRun{
+		phase: string(PhaseProve), harness: m.ReviewHarness, entry: entry, adapter: adapter,
+		authMode: authMode, route: reviewRoute(m), agent: reviewerAgent,
+	}
+	runID, err := newRunID()
+	if err != nil {
+		return ReviewVerdict{}, fallbackSpawnFailed, err
+	}
+	rdir := runDir(m.Workspace, "review-"+runID)
+	spec := executor.InvocationSpec{
+		MissionID: m.ID, Workdir: workRoot,
+		PromptPath:   filepath.Join(rdir, "prompt.md"),
+		SystemAppend: reviewSystemPrompt + delegatedReviewSystemAppend,
+		Model:        entry.Model, AuthMode: authMode, APIKey: apiKey, BaseURL: entry.BaseURL,
+		ResultSchema: reviewVerdictSchema, RunBudget: r.effectiveRunBudget(ctx), Wire: entry.Wire,
+		// ResumeSessionID stays empty: every review round is a cold
+		// session (D-092). ReadOnly is the enforced safety knob.
+		ReadOnly: true,
+	}
+	if err := r.launchRun(ctx, m, run, workRoot, rdir, runID, spec, renderReviewContent(packet), resumeDecision{reason: resumeReasonNoPriorRun}); err != nil {
+		if errors.Is(err, executor.ErrReadOnlyUnsupported) {
+			return ReviewVerdict{}, fallbackRefused, err
+		}
+		return ReviewVerdict{}, fallbackSpawnFailed, err
+	}
+
+	start := time.Now()
+	st, end, exitCode, err := r.pollRun(ctx, m, run, workRoot, rdir, runID, 0)
+	if err != nil {
+		return ReviewVerdict{}, fallbackPollFailed, err
+	}
+	switch end {
+	case runEndResult:
+		return r.finishReview(ctx, m, run, st, start, exitCode)
+	case runEndIdle:
+		return ReviewVerdict{}, fallbackNoResult, errors.New("the executor produced no output for the idle timeout and was killed")
+	default:
+		reason, err := r.finishNoResult(ctx, m, run, workRoot, rdir, st, start, exitCode)
+		if err != nil {
+			return ReviewVerdict{}, fallbackAuthFailed, err
+		}
+		return ReviewVerdict{}, fallbackNoResult, errors.New(reason)
+	}
+}
+
+// finishReview maps a review run's result event onto a ReviewVerdict
+// (issue #582): the structured result must decode with an explicit
+// approve/rework decision, else the round falls back to native rather
+// than letting a garbage result read as "rework with no findings" (which
+// the driver's gate would count as approval). Result and ledger rows are
+// recorded either way, same as a worker run.
+func (r *delegatedRunner) finishReview(ctx context.Context, m Mission, run cliRun, st *pollState, start time.Time, exitCode int) (ReviewVerdict, string, error) {
+	verdict, decision, perr := parseDelegatedReviewVerdict(st.resultEvent.Result)
+	parseKind := "schema"
+	if perr != nil {
+		parseKind = "none"
+	}
+	authErr := r.finishCommon(ctx, m, run, st, start, exitCode, parseKind, decision)
+	if authErr != nil {
+		return ReviewVerdict{}, fallbackAuthFailed, authErr
+	}
+	if perr != nil {
+		return ReviewVerdict{}, fallbackUnparseableResult, perr
+	}
+	verdict.Provider = run.entry.ProviderName
+	verdict.Model = run.entry.Model
+	if st.reportedModel != "" {
+		verdict.Model = st.reportedModel
+	}
+	return verdict, "", nil
+}
+
+// parseDelegatedReviewVerdict decodes a CLI result payload with
+// parseReviewVerdict and additionally requires the decision to be
+// literally approve or rework. Returns the upper-cased decision for the
+// executor.result event ("UNKNOWN" when it fails).
+func parseDelegatedReviewVerdict(raw json.RawMessage) (ReviewVerdict, string, error) {
+	if len(raw) == 0 {
+		return ReviewVerdict{}, "UNKNOWN", errors.New("executor result carried no structured verdict")
+	}
+	var probe struct {
+		Decision string `json:"decision"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return ReviewVerdict{}, "UNKNOWN", fmt.Errorf("decode review verdict: %w", err)
+	}
+	if probe.Decision != "approve" && probe.Decision != "rework" {
+		return ReviewVerdict{}, "UNKNOWN", fmt.Errorf("review verdict decision %q is neither approve nor rework", probe.Decision)
+	}
+	verdict, err := parseReviewVerdict(raw)
+	if err != nil {
+		return ReviewVerdict{}, "UNKNOWN", fmt.Errorf("decode review verdict: %w", err)
+	}
+	return verdict, strings.ToUpper(probe.Decision), nil
+}
+
+// pickEntry picks the chain entry a review run uses (issue #582): the
+// route_model pin when it names a usable, non-cooled entry, else the
+// first usable non-cooled one. A non-empty reason names why none fit.
+func (r *delegatedRunner) pickEntry(entries []gwclient.ResolvedRouteEntry, harness, pin string) (gwclient.ResolvedRouteEntry, string) {
+	if pin != "" {
+		for _, entry := range entries {
+			if pin != entry.ProviderName+"/"+entry.Model || !entry.Usable {
+				continue
+			}
+			if _, cooled := r.cooledUntil(harness, entry); !cooled {
+				return entry, ""
+			}
+		}
+	}
+	cooled := false
+	for _, entry := range entries {
+		if !entry.Usable {
+			continue
+		}
+		if _, c := r.cooledUntil(harness, entry); c {
+			cooled = true
+			continue
+		}
+		return entry, ""
+	}
+	if cooled {
+		return gwclient.ResolvedRouteEntry{}, fallbackCooldown
+	}
+	return gwclient.ResolvedRouteEntry{}, fallbackNoUsableEntry
 }
 
 // RunWorker dispatches on m.Harness (D-051 rework): "" defers straight
@@ -231,7 +446,7 @@ func (r *delegatedRunner) RunReview(ctx context.Context, m Mission, packet Revie
 // shows the requested harness was never actually used. A route resolve
 // that fails because the gateway itself is unavailable (D-101, issue
 // #511) is different: that is transient infra, not "no delegated
-// route", so resolveRouteWithRetry retries it with bounded backoff and,
+// route", so resolveRouteFor retries it with bounded backoff and,
 // if still failing, this returns ErrGatewayUnavailable instead of
 // falling back: the driver pauses the mission as infra rather than
 // running a native worker turn behind a delegated run that may still be
@@ -256,7 +471,7 @@ func (r *delegatedRunner) RunWorker(ctx context.Context, m Mission, packet WorkP
 		return r.native.RunWorker(ctx, m, packet)
 	}
 
-	route, err := r.resolveRouteWithRetry(ctx, m, workerRoute(m))
+	route, err := r.resolveRouteFor(ctx, m, workerRoute(m), m.Harness)
 	if err != nil {
 		if errors.Is(err, gwclient.ErrGatewayUnavailable) {
 			r.log.Error("delegated runner: gateway unavailable after retries; pausing as infra", "mission_id", m.ID, "error", err)
@@ -331,7 +546,7 @@ func (r *delegatedRunner) RunWorker(ctx context.Context, m Mission, packet WorkP
 	return r.native.RunWorker(ctx, m, packet)
 }
 
-// resolveRouteWithRetry resolves route on the harness's executor axis,
+// resolveRouteFor resolves route on harness's executor axis,
 // retrying with bounded exponential backoff (routeResolveRetries
 // attempts, starting at routeResolveBackoffMin) ONLY when the failure is
 // gwclient.ErrGatewayUnavailable, the gateway unreachable or still
@@ -342,11 +557,11 @@ func (r *delegatedRunner) RunWorker(ctx context.Context, m Mission, packet WorkP
 // retrying them would just delay the existing native fallback. Bounded
 // and ctx-aware: a cancelled ctx or an exhausted retry budget both
 // return the last error seen.
-func (r *delegatedRunner) resolveRouteWithRetry(ctx context.Context, m Mission, route string) (*gwclient.ResolvedRoute, error) {
+func (r *delegatedRunner) resolveRouteFor(ctx context.Context, m Mission, route, harness string) (*gwclient.ResolvedRoute, error) {
 	backoff := r.routeResolveBackoff
 	var lastErr error
 	for attempt := 1; attempt <= routeResolveRetries; attempt++ {
-		resolved, err := r.resolveRoute(ctx, route, m.Harness)
+		resolved, err := r.resolveRoute(ctx, route, harness)
 		if err == nil {
 			return resolved, nil
 		}
@@ -486,7 +701,7 @@ var resultSchemaJSON = json.RawMessage(`{"type":"object","properties":{"status":
 // and that DONE means every acceptance criterion is met even though the
 // harness-side verify_cmd/CheckArtifacts runs regardless of what it
 // reports.
-const delegatedSystemAppend = " You are running as a delegated coding CLI, not through mission_status. End your turn by producing the required structured output with status DONE, RETRY, or BLOCKED and a short note. Only report DONE when every acceptance criterion for the current unit is genuinely met — the harness independently verifies your artifacts and verify_cmd regardless of what you report, so a false DONE only costs a wasted review round, never actually passes."
+const delegatedSystemAppend = " You are running as a delegated coding CLI, not through mission_status. End your turn by producing the required structured output with status DONE, RETRY, or BLOCKED and a short note. Only report DONE when every acceptance criterion for the current unit is genuinely met — the harness independently verifies your artifacts and verify_cmd regardless of what you report, so a false DONE only costs a wasted review round, never actually passes. The harness commits the unit's files itself after your turn, so never run git add, commit, reset, stash, or checkout."
 
 // delegatedAllowTools/delegatedDenyTools are the delegated worker's
 // static tool surface, passed as the CLI's own allow/deny flags at
@@ -499,6 +714,30 @@ var (
 	delegatedAllowTools = []string{"Read", "Glob", "Grep", "Edit", "Write", "MultiEdit", "Bash", "TodoWrite"}
 	delegatedDenyTools  = []string{"Bash(git push:*)", "WebFetch", "WebSearch"}
 )
+
+// cliRun is the per-run context the shared D-052 protocol threads
+// through launch, poll, finish and bookkeeping (issue #582): a worker
+// run (phase generate) and a review run (phase prove) differ only in
+// these fields. Every executor.* event a run records carries phase.
+type cliRun struct {
+	phase    string
+	harness  string
+	entry    gwclient.ResolvedRouteEntry
+	adapter  executor.Adapter
+	authMode executor.AuthMode
+	// route/agent label the run's ledger row.
+	route, agent string
+	// steer allows mid-run operator note delivery (worker runs only).
+	steer bool
+}
+
+// workerRun builds the cliRun for a worker turn.
+func workerRun(m Mission, entry gwclient.ResolvedRouteEntry, adapter executor.Adapter, authMode executor.AuthMode) cliRun {
+	return cliRun{
+		phase: string(PhaseGenerate), harness: m.Harness, entry: entry, adapter: adapter,
+		authMode: authMode, route: workerRoute(m), agent: "mission-worker", steer: true,
+	}
+}
 
 // runDelegated executes the D-052 protocol for one chain entry: resolve
 // credentials, build the invocation, launch detached, poll to
@@ -514,9 +753,10 @@ func (r *delegatedRunner) runDelegated(ctx context.Context, m Mission, packet Wo
 	authMode, apiKey, err := r.resolveCredential(ctx, entry.CredentialRef, adapter.Capabilities())
 	if err != nil {
 		r.coolDown(m.Harness, entry)
-		r.recordAuthFailed(ctx, m.ID, m.Harness)
+		r.recordAuthFailed(ctx, m.ID, string(PhaseGenerate), m.Harness)
 		return WorkerVerdict{}, "", err
 	}
+	run := workerRun(m, entry, adapter, authMode)
 
 	runID, err := newRunID()
 	if err != nil {
@@ -529,46 +769,74 @@ func (r *delegatedRunner) runDelegated(ctx context.Context, m Mission, packet Wo
 
 	decision := r.planSessionResume(ctx, m, workRoot, adapter)
 
-	runBudget := r.effectiveRunBudget(ctx)
 	spec := executor.InvocationSpec{
 		MissionID: m.ID, Workdir: workRoot,
 		PromptPath:   filepath.Join(rdir, "prompt.md"),
 		SystemAppend: system,
 		Model:        entry.Model, AuthMode: authMode, APIKey: apiKey, BaseURL: entry.BaseURL,
 		AllowTools: delegatedAllowTools, DenyTools: delegatedDenyTools,
-		ResultSchema: resultSchemaJSON, RunBudget: runBudget, Wire: entry.Wire,
+		ResultSchema: resultSchemaJSON, RunBudget: r.effectiveRunBudget(ctx), Wire: entry.Wire,
 		ResumeSessionID: decision.sessionID,
 	}
-	inv, err := adapter.BuildInvocation(spec)
+	if err := r.launchRun(ctx, m, run, workRoot, rdir, runID, spec, user, decision); err != nil {
+		return WorkerVerdict{}, "", err
+	}
+
+	return r.pollToVerdict(ctx, m, run, workRoot, rdir, runID, 0)
+}
+
+// launchRun builds the invocation, writes prompt.md (plus a Steerer's
+// prompt.jsonl/steer.jsonl), records executor.spawned and starts the
+// CLI detached. Shared by worker and review runs (issue #582); every
+// failure cools the entry down before returning.
+func (r *delegatedRunner) launchRun(ctx context.Context, m Mission, run cliRun, workRoot, rdir, runID string, spec executor.InvocationSpec, user string, decision resumeDecision) error {
+	inv, err := run.adapter.BuildInvocation(spec)
 	if err != nil {
-		r.coolDown(m.Harness, entry)
-		return WorkerVerdict{}, "", fmt.Errorf("delegated runner: build invocation: %w", err)
+		r.coolDown(run.harness, run.entry)
+		return fmt.Errorf("delegated runner: build invocation: %w", err)
 	}
 
 	// 0750/0600 suffice: brain and the sandbox CLI share uid 65534 on
 	// the workspace volume, so owner permissions cover both readers.
 	if err := os.MkdirAll(rdir, 0o750); err != nil {
-		r.coolDown(m.Harness, entry)
-		return WorkerVerdict{}, "", fmt.Errorf("delegated runner: create run dir: %w", err)
+		r.coolDown(run.harness, run.entry)
+		return fmt.Errorf("delegated runner: create run dir: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(rdir, "prompt.md"), []byte(user), 0o600); err != nil {
-		r.coolDown(m.Harness, entry)
-		return WorkerVerdict{}, "", fmt.Errorf("delegated runner: write prompt: %w", err)
+		r.coolDown(run.harness, run.entry)
+		return fmt.Errorf("delegated runner: write prompt: %w", err)
 	}
 	if err := writeInvocationFiles(rdir, inv.Files); err != nil {
-		r.coolDown(m.Harness, entry)
-		return WorkerVerdict{}, "", fmt.Errorf("delegated runner: write invocation files: %w", err)
+		r.coolDown(run.harness, run.entry)
+		return fmt.Errorf("delegated runner: write invocation files: %w", err)
+	}
+	// issue #358: a Steerer adapter (pi) takes its prompt and any
+	// mid-run steering on stdin rather than argv - prompt.jsonl seeds
+	// the run's stdin, steer.jsonl starts empty and pollRun appends a
+	// line to it for every fresh operator note while the run is alive
+	// (see buildLaunchCmd's stdin mode). A review run uses the same
+	// stdin shape (pi's rpc mode takes the prompt there) but never
+	// appends steering.
+	steerer, isSteerer := run.adapter.(executor.Steerer)
+	if isSteerer {
+		if err := os.WriteFile(filepath.Join(rdir, "prompt.jsonl"), []byte(steerer.PromptCommand(user)+"\n"), 0o600); err != nil {
+			r.coolDown(run.harness, run.entry)
+			return fmt.Errorf("delegated runner: write prompt.jsonl: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join(rdir, "steer.jsonl"), nil, 0o600); err != nil {
+			r.coolDown(run.harness, run.entry)
+			return fmt.Errorf("delegated runner: create steer.jsonl: %w", err)
+		}
 	}
 
-	r.recordSpawned(ctx, m.ID, m.Harness, entry, runID, rdir, authMode, decision)
+	r.recordSpawned(ctx, m.ID, run, runID, rdir, decision)
 
-	if err := r.launch(ctx, m.ID, m.Environment, workRoot, rdir, inv, runBudget); err != nil {
-		r.coolDown(m.Harness, entry)
-		r.recordDied(ctx, m.ID, "spawn_failed", nil, err.Error())
-		return WorkerVerdict{}, "", fmt.Errorf("delegated runner: launch: %w", err)
+	if err := r.launch(ctx, m.ID, m.Environment, workRoot, rdir, inv, spec.RunBudget, isSteerer); err != nil {
+		r.coolDown(run.harness, run.entry)
+		r.recordDied(ctx, m.ID, run.phase, "spawn_failed", nil, err.Error())
+		return fmt.Errorf("delegated runner: launch: %w", err)
 	}
-
-	return r.pollToVerdict(ctx, m, workRoot, rdir, runID, entry, adapter, authMode, 0)
+	return nil
 }
 
 // attemptResume checks for an unfinished run recorded by a prior
@@ -596,11 +864,11 @@ func (r *delegatedRunner) attemptResume(ctx context.Context, m Mission, workRoot
 	probeCmd := fmt.Sprintf("cd %s && { [ -f exit_code ] || [ -f pid ]; }", shQuote(state.RunDir))
 	code, perr := r.sandboxExec(ctx, m.ID, m.Environment, workRoot, probeCmd, nil, launchTimeout, &probe)
 	if perr != nil || code != 0 {
-		r.recordDied(ctx, m.ID, "lost_run", nil, "run directory or pid missing after restart")
+		r.recordDied(ctx, m.ID, string(PhaseGenerate), "lost_run", nil, "run directory or pid missing after restart")
 		return true, forcedRetryVerdict("the executor's run was lost across a restart"), "", nil
 	}
 
-	v, t, rerr := r.pollToVerdict(ctx, m, workRoot, state.RunDir, state.RunID, entry, adapter, state.AuthMode, state.ByteOffset)
+	v, t, rerr := r.pollToVerdict(ctx, m, workerRun(m, entry, adapter, state.AuthMode), workRoot, state.RunDir, state.RunID, state.ByteOffset)
 	return true, v, t, rerr
 }
 
@@ -659,9 +927,11 @@ func (r *delegatedRunner) planSessionResume(ctx context.Context, m Mission, work
 // redirected into the run directory. The `timeout` wrapper (D-052)
 // enforces spec.RunBudget itself, independent of anything brain does
 // afterward — a crashed brain still lets the container kill a runaway
-// CLI.
-func (r *delegatedRunner) launch(ctx context.Context, missionID, environment, workdir, rdir string, inv executor.Invocation, runBudget time.Duration) error {
-	launchCmd, err := buildLaunchCmd(workdir, rdir, inv, runBudget)
+// CLI. stdinMode is true for a Steerer adapter (issue #358): the CLI's
+// stdin stays open for the run's life via `tail -f steer.jsonl` so a
+// later mid-run steer command can still reach it.
+func (r *delegatedRunner) launch(ctx context.Context, missionID, environment, workdir, rdir string, inv executor.Invocation, runBudget time.Duration, stdinMode bool) error {
+	launchCmd, err := buildLaunchCmd(workdir, rdir, inv, runBudget, stdinMode)
 	if err != nil {
 		return err
 	}
@@ -694,16 +964,35 @@ const containerMarkerFile = ".timothy-container-marker"
 // script is quoted as ONE unit via shQuote — composing it with literal
 // quotes would let the argv elements' own single quotes toggle the
 // outer quoting and word-split any argument containing spaces (the
-// system-prompt append, most obviously).
-func buildLaunchCmd(workdir, rdir string, inv executor.Invocation, runBudget time.Duration) (string, error) {
+// system-prompt append, most obviously). stdinMode (issue #358) feeds
+// the CLI's stdin from prompt.jsonl followed by `tail -f steer.jsonl`
+// instead of the plain argv-only invocation: `tail -f` keeps stdin open
+// for the run's life, so a later append to steer.jsonl (pollToVerdict's
+// steering injection) still reaches the running process; killRun's
+// existing TERM/KILL path ends the process (and its stdin pipe) exactly
+// as it does today.
+func buildLaunchCmd(workdir, rdir string, inv executor.Invocation, runBudget time.Duration, stdinMode bool) (string, error) {
 	argv, err := renderArgv(inv)
 	if err != nil {
 		return "", err
 	}
-	inner := fmt.Sprintf(
-		"timeout -k 30 %d %s > %s/run.ndjson 2> %s/stderr.log; echo $? > %s/exit_code",
-		int(runBudget/time.Second), argv, shQuote(rdir), shQuote(rdir), shQuote(rdir),
-	)
+	var inner string
+	if stdinMode {
+		// The feeder (prompt line, then tail -f steer.jsonl) writes into a
+		// fifo the CLI reads as stdin; its pid lands in stdin.pid so
+		// closeStdin can end the feed once the run's result has arrived,
+		// which gives the CLI EOF and lets it exit on its own. exec keeps
+		// tail's pid equal to the recorded one.
+		inner = fmt.Sprintf(
+			"rm -f %[1]s/stdin.fifo && mkfifo %[1]s/stdin.fifo && { ( cat %[1]s/prompt.jsonl; exec tail -f %[1]s/steer.jsonl ) > %[1]s/stdin.fifo & echo $! > %[1]s/stdin.pid; }; timeout -k 30 %[2]d %[3]s < %[1]s/stdin.fifo > %[1]s/run.ndjson 2> %[1]s/stderr.log; echo $? > %[1]s/exit_code; kill \"$(cat %[1]s/stdin.pid)\" 2>/dev/null",
+			shQuote(rdir), int(runBudget/time.Second), argv,
+		)
+	} else {
+		inner = fmt.Sprintf(
+			"timeout -k 30 %d %s > %s/run.ndjson 2> %s/stderr.log; echo $? > %s/exit_code",
+			int(runBudget/time.Second), argv, shQuote(rdir), shQuote(rdir), shQuote(rdir),
+		)
+	}
 	// Braces bound the `&` to the setsid job alone — a bare `cd && mkdir
 	// && setsid ... & echo $!` backgrounds the whole chain and races the
 	// pid write against the mkdir it depends on. The marker write runs
@@ -766,6 +1055,9 @@ type pollState struct {
 	toolCalls    int
 	sawResult    bool
 	resultEvent  executor.Event
+	// stdinClosed marks that closeStdin already ended a Steerer run's
+	// stdin feed after its result arrived (issue #358).
+	stdinClosed bool
 	// reportedModel is the model the harness itself said it ran, from
 	// its KindSystem init line. Preferred over the route entry's model
 	// when recording usage: a self-paired harness's provider row carries
@@ -786,15 +1078,62 @@ type pollState struct {
 	sessionRecorded bool
 }
 
-// pollToVerdict polls rdir until the run terminates (exit_code present
-// and run.ndjson fully drained), the idle watchdog fires, ctx is
-// cancelled, or repeated infra errors declare the sandbox unreachable.
-// startOffset seeds the byte offset on a resumed run; 0 for a fresh
-// spawn.
-func (r *delegatedRunner) pollToVerdict(ctx context.Context, m Mission, workRoot, rdir, runID string, entry gwclient.ResolvedRouteEntry, adapter executor.Adapter, authMode executor.AuthMode, startOffset int64) (WorkerVerdict, string, error) {
-	parser := adapter.NewParser()
-	st := &pollState{offset: startOffset, lastByteMove: time.Now(), lastProgress: time.Now()}
+// pollToVerdict runs pollRun for a worker turn and maps how the run
+// ended onto a WorkerVerdict: the result ladder (finish), a forced
+// retry for an idle kill, or finishNoResult's transport-death handling.
+func (r *delegatedRunner) pollToVerdict(ctx context.Context, m Mission, run cliRun, workRoot, rdir, runID string, startOffset int64) (WorkerVerdict, string, error) {
 	start := time.Now()
+	st, end, exitCode, err := r.pollRun(ctx, m, run, workRoot, rdir, runID, startOffset)
+	if err != nil {
+		return WorkerVerdict{}, st.textBuf.String(), err
+	}
+	switch end {
+	case runEndResult:
+		return r.finish(ctx, m, run, st, start, exitCode)
+	case runEndIdle:
+		return forcedRetryVerdict("the executor produced no output for the idle timeout and was killed"), st.textBuf.String(), nil
+	default:
+		reason, err := r.finishNoResult(ctx, m, run, workRoot, rdir, st, start, exitCode)
+		if err != nil {
+			return WorkerVerdict{}, st.textBuf.String(), err
+		}
+		return forcedRetryVerdict(reason), st.textBuf.String(), nil
+	}
+}
+
+// runEnd names how pollRun saw a run end.
+type runEnd int
+
+const (
+	runEndResult   runEnd = iota // result event seen and the process exited
+	runEndNoResult               // process exited or was lost with no result event
+	runEndIdle                   // idle watchdog killed it
+)
+
+// pollRun polls rdir until the run terminates (exit_code present and
+// run.ndjson fully drained), the idle watchdog fires, ctx is cancelled,
+// or repeated infra errors declare the sandbox unreachable. startOffset
+// seeds the byte offset on a resumed run; 0 for a fresh spawn. The
+// returned pollState is never nil, so callers can read the accumulated
+// text even on error. exitCode is -1 when the process was lost.
+func (r *delegatedRunner) pollRun(ctx context.Context, m Mission, run cliRun, workRoot, rdir, runID string, startOffset int64) (*pollState, runEnd, int, error) {
+	parser := run.adapter.NewParser()
+	st := &pollState{offset: startOffset, lastByteMove: time.Now(), lastProgress: time.Now()}
+
+	// Mid-run steering (issue #358) applies only to a Steerer adapter
+	// (pi's rpc mode) on a worker run with a progress reader wired;
+	// steerer stays nil otherwise and the injection below is skipped.
+	// The stdin feed itself (stdinFeed) exists for every Steerer run,
+	// review runs included, and is closed once the result arrives. The
+	// watermark starts past the operator notes already rendered into
+	// this turn's packet (same seed as nativeRunner.steeringFor), so a
+	// note from an earlier turn is never redelivered as fresh steering.
+	_, stdinFeed := run.adapter.(executor.Steerer)
+	var steerer executor.Steerer
+	if s, ok := run.adapter.(executor.Steerer); ok && run.steer && r.progressReader != nil {
+		steerer = s
+	}
+	steerWatermark := countOperatorNotes(m.Progress)
 
 	ticker := time.NewTicker(r.pollInterval)
 	defer ticker.Stop()
@@ -803,9 +1142,9 @@ func (r *delegatedRunner) pollToVerdict(ctx context.Context, m Mission, workRoot
 		select {
 		case <-ctx.Done():
 			r.killRun(context.WithoutCancel(ctx), m.ID, m.Environment, workRoot, rdir)
-			r.recordDied(context.WithoutCancel(ctx), m.ID, "ctx_cancelled", nil, ctx.Err().Error())
-			r.coolDown(m.Harness, entry)
-			return WorkerVerdict{}, st.textBuf.String(), ctx.Err()
+			r.recordDied(context.WithoutCancel(ctx), m.ID, run.phase, "ctx_cancelled", nil, ctx.Err().Error())
+			r.coolDown(run.harness, run.entry)
+			return st, runEndNoResult, -1, ctx.Err()
 		case <-ticker.C:
 		}
 
@@ -813,7 +1152,7 @@ func (r *delegatedRunner) pollToVerdict(ctx context.Context, m Mission, workRoot
 		if err != nil {
 			st.infraRetries++
 			if st.infraRetries >= pollInfraRetries {
-				return WorkerVerdict{}, st.textBuf.String(), fmt.Errorf("delegated runner: sandbox unreachable after %d poll retries: %w", pollInfraRetries, err)
+				return st, runEndNoResult, -1, fmt.Errorf("delegated runner: sandbox unreachable after %d poll retries: %w", pollInfraRetries, err)
 			}
 			time.Sleep(pollInfraBackoff)
 			continue
@@ -823,34 +1162,99 @@ func (r *delegatedRunner) pollToVerdict(ctx context.Context, m Mission, workRoot
 			st.worktree = worktree
 		}
 
+		// Steer injection runs BEFORE this poll's own terminal checks: a
+		// run already alive (before we know from this same poll whether
+		// it just finished) and never having produced a result yet is the
+		// only safe window - pi exits 0 on stdin EOF, and a steer command
+		// arriving after agent_end starts a whole NEW agent run instead of
+		// queuing onto the current one (verified against pi 0.84.1),
+		// so injection must stop the instant a terminal event was parsed.
+		if steerer != nil && alive && !st.sawResult {
+			steerWatermark = r.injectSteering(ctx, m, workRoot, rdir, steerer, steerWatermark)
+		}
+
 		if len(chunk) > 0 {
 			st.offset += int64(len(chunk))
 			st.lastByteMove = time.Now()
-			r.feedLines(ctx, parser, chunk, st, m.ID, runID)
-			r.recordProgressThrottled(ctx, m.ID, runID, st)
+			r.feedLines(ctx, parser, chunk, st, m.ID, run.phase, runID)
+			r.recordProgressThrottled(ctx, m.ID, run.phase, runID, st)
+		}
+
+		// A Steerer run never exits on its own: its stdin feed holds the
+		// CLI open (issue #358). Once the result has arrived, end the feed
+		// so the CLI sees EOF, exits, and the next poll finishes normally.
+		if stdinFeed && st.sawResult && alive && !hasExit && !st.stdinClosed {
+			r.closeStdin(ctx, m, workRoot, rdir)
+			st.stdinClosed = true
 		}
 
 		if st.sawResult && hasExit {
-			return r.finish(ctx, m, entry, adapter, authMode, st, start, exitCode)
+			return st, runEndResult, exitCode, nil
 		}
 		if hasExit && !alive {
 			// Process exited; run.ndjson fully drained (no new bytes this
-			// poll) but no result event ever arrived — transport death.
-			return r.finishNoResult(ctx, m, entry, workRoot, rdir, authMode, st, start, exitCode)
+			// poll) but no result event ever arrived: transport death.
+			return st, runEndNoResult, exitCode, nil
 		}
 		if !alive && !hasExit {
 			// pid gone, no exit_code file: process died without even
-			// writing its own exit status — still transport death.
-			return r.finishNoResult(ctx, m, entry, workRoot, rdir, authMode, st, start, -1)
+			// writing its own exit status, still transport death.
+			return st, runEndNoResult, -1, nil
 		}
 
 		if time.Since(st.lastByteMove) > r.idleTimeout {
 			r.killRun(ctx, m.ID, m.Environment, workRoot, rdir)
-			r.recordEvent(ctx, m.ID, st, "executor.idle_killed", map[string]any{"idle_s": int(r.idleTimeout.Seconds())})
-			r.coolDown(m.Harness, entry)
-			return forcedRetryVerdict("the executor produced no output for the idle timeout and was killed"), st.textBuf.String(), nil
+			r.recordEvent(ctx, m.ID, st, "executor.idle_killed", map[string]any{"idle_s": int(r.idleTimeout.Seconds()), "phase": run.phase})
+			r.coolDown(run.harness, run.entry)
+			return st, runEndIdle, -1, nil
 		}
 	}
+}
+
+// closeStdin ends a Steerer run's stdin feed by killing the recorded
+// feeder pid (issue #358): the fifo's write side closes, the CLI reads
+// EOF and exits, and the run finishes through the regular exit path.
+// Best effort: a failure logs and leaves the idle timeout as the
+// fallback.
+func (r *delegatedRunner) closeStdin(ctx context.Context, m Mission, workRoot, rdir string) {
+	cmd := fmt.Sprintf("kill \"$(cat %s/stdin.pid)\" 2>/dev/null", shQuote(rdir))
+	var out bytes.Buffer
+	if code, err := r.sandboxExec(ctx, m.ID, m.Environment, workRoot, cmd, nil, launchTimeout, &out); err != nil || code != 0 {
+		r.log.Warn("delegated runner: close stdin failed", "mission_id", m.ID, "error", err, "exit_code", code)
+	}
+}
+
+// injectSteering delivers every fresh operator note (past watermark) to
+// a Steerer adapter's in-flight run by appending one SteerCommand line
+// per note to rdir/steer.jsonl, and records an executor.steered event
+// for each (issue #358). Returns the advanced watermark; on a failed
+// poll or append, returns watermark unchanged (never advanced past what
+// was actually delivered) and logs a warning - steering is a best-
+// effort mid-run nicety, same stance as nativeRunner.steeringFor, so a
+// failure here never fails the run.
+func (r *delegatedRunner) injectSteering(ctx context.Context, m Mission, workRoot, rdir string, steerer executor.Steerer, watermark int) int {
+	notes, err := r.progressReader.Progress(ctx, m.ID)
+	if err != nil {
+		r.log.Warn("delegated runner: poll steering notes failed", "mission_id", m.ID, "error", err)
+		return watermark
+	}
+	fresh, newWatermark := freshOperatorNotes(notes, watermark)
+	delivered := watermark
+	for _, note := range fresh {
+		line := steerer.SteerCommand("Operator steering note (mid-run): " + note)
+		cmd := fmt.Sprintf("printf '%%s\\n' %s >> %s/steer.jsonl", shQuote(line), shQuote(rdir))
+		var out bytes.Buffer
+		if code, err := r.sandboxExec(ctx, m.ID, m.Environment, workRoot, cmd, nil, launchTimeout, &out); err != nil || code != 0 {
+			// Only the notes actually appended so far count toward the
+			// watermark - a note that failed to append must be retried on
+			// the next poll, never skipped.
+			r.log.Warn("delegated runner: steer append failed", "mission_id", m.ID, "error", err, "exit_code", code)
+			return delivered
+		}
+		delivered++
+		r.recordEventForce(ctx, m.ID, "executor.steered", map[string]any{"note": note, "harness": m.Harness, "phase": string(PhaseGenerate)})
+	}
+	return newWatermark
 }
 
 // pollBoundaryPrefix + runID makes the boundary marker printf'd between
@@ -971,7 +1375,7 @@ func parseWorktreeLine(fields string) (*WorktreeSummary, bool) {
 // Incomplete trailing bytes (no terminating newline yet) are held in
 // st.carry until the next chunk completes them — mid-line chunk splits
 // must never be fed to the parser as a partial line.
-func (r *delegatedRunner) feedLines(ctx context.Context, parser executor.StreamParser, chunk []byte, st *pollState, missionID, runID string) {
+func (r *delegatedRunner) feedLines(ctx context.Context, parser executor.StreamParser, chunk []byte, st *pollState, missionID, phase, runID string) {
 	data := append(st.carry, chunk...)
 	st.carry = nil
 	for {
@@ -993,7 +1397,7 @@ func (r *delegatedRunner) feedLines(ctx context.Context, parser executor.StreamP
 			}
 			if ev.SessionID != "" && st.sessionID == "" {
 				st.sessionID = ev.SessionID
-				r.recordSessionSeen(ctx, missionID, runID, st)
+				r.recordSessionSeen(ctx, missionID, phase, runID, st)
 			}
 		case executor.KindText:
 			st.textBuf.WriteString(ev.Text)
@@ -1027,8 +1431,8 @@ func (r *delegatedRunner) killRun(ctx context.Context, missionID, environment, w
 // whether the run also flagged an error); failing that, a text-form
 // sentinel in the accumulated text; failing that, a forced retry noting
 // the executor never reported a status.
-func (r *delegatedRunner) finish(ctx context.Context, m Mission, entry gwclient.ResolvedRouteEntry, adapter executor.Adapter, authMode executor.AuthMode, st *pollState, start time.Time, exitCode int) (WorkerVerdict, string, error) {
-	res, ok := adapter.ParseResult(st.resultEvent)
+func (r *delegatedRunner) finish(ctx context.Context, m Mission, run cliRun, st *pollState, start time.Time, exitCode int) (WorkerVerdict, string, error) {
+	res, ok := run.adapter.ParseResult(st.resultEvent)
 	parseKind := "schema"
 	var verdict WorkerVerdict
 	switch {
@@ -1052,12 +1456,24 @@ func (r *delegatedRunner) finish(ctx context.Context, m Mission, entry gwclient.
 	// sentinel), so the entry that ran it is who served the turn.
 	// reportedModel (the harness's own claimed model) takes precedence
 	// over entry.Model, same precedence recordLedger already uses.
-	verdict.Provider = entry.ProviderName
-	verdict.Model = entry.Model
+	verdict.Provider = run.entry.ProviderName
+	verdict.Model = run.entry.Model
 	if st.reportedModel != "" {
 		verdict.Model = st.reportedModel
 	}
 
+	if err := r.finishCommon(ctx, m, run, st, start, exitCode, parseKind, strings.ToUpper(verdict.Outcome)); err != nil {
+		return WorkerVerdict{}, st.textBuf.String(), err
+	}
+	return verdict, st.textBuf.String(), nil
+}
+
+// finishCommon is the bookkeeping every finished run shares (issue
+// #582): the executor.result event, the ledger row, and the auth-failure
+// check, which cools the entry down and returns ErrExecutorAuth since
+// retrying the same entry is futile. status is the parsed verdict
+// (DONE/RETRY/BLOCKED for a worker, APPROVE/REWORK for a review).
+func (r *delegatedRunner) finishCommon(ctx context.Context, m Mission, run cliRun, st *pollState, start time.Time, exitCode int, parseKind, status string) error {
 	authFailed := st.resultEvent.Err != "" && isAuthFailure(st.resultEvent.Err)
 	errorCode := ""
 	if authFailed {
@@ -1074,24 +1490,25 @@ func (r *delegatedRunner) finish(ctx context.Context, m Mission, entry gwclient.
 	// an anthropic-driver row. Every other path either books a
 	// different, provider-priced figure or none at all, so the UI must
 	// not present the raw CLI number as billed.
-	cliCostTrusted := authMode == executor.AuthAPIKey && entry.Driver == "anthropic" && adapter.Capabilities().ReportsCost
-	r.recordResult(ctx, m.ID, st, start, exitCode, st.resultEvent, parseKind, strings.ToUpper(verdict.Outcome), cliCostTrusted)
-	r.recordLedger(ctx, m, entry, authMode, st.resultEvent.Usage, start, exitCode == 0 && st.resultEvent.Err == "", errorCode, st.reportedModel)
+	cliCostTrusted := run.authMode == executor.AuthAPIKey && run.entry.Driver == "anthropic" && run.adapter.Capabilities().ReportsCost
+	r.recordResult(ctx, m.ID, run.phase, st, start, exitCode, st.resultEvent, parseKind, status, cliCostTrusted)
+	r.recordLedger(ctx, m, run, st.resultEvent.Usage, start, exitCode == 0 && st.resultEvent.Err == "", errorCode, st.reportedModel)
 	if authFailed {
-		r.coolDown(m.Harness, entry)
-		r.recordAuthFailed(ctx, m.ID, m.Harness)
-		return WorkerVerdict{}, st.textBuf.String(), fmt.Errorf("%w: %s", ErrExecutorAuth, st.resultEvent.Err)
+		r.coolDown(run.harness, run.entry)
+		r.recordAuthFailed(ctx, m.ID, run.phase, run.harness)
+		return fmt.Errorf("%w: %s", ErrExecutorAuth, st.resultEvent.Err)
 	}
-	return verdict, st.textBuf.String(), nil
+	return nil
 }
 
 // finishNoResult handles transport death: the process ended (or was
 // lost) with no result event ever parsed. Per the result ladder this is
-// a forced RETRY, EXCEPT auth failure and sandbox-unreachable cases,
-// which return an error instead since retrying the same entry is
-// futile. An extra exec reads stderr.log's tail only on this path (exit
-// != 0, no result) to check for auth-failure signatures.
-func (r *delegatedRunner) finishNoResult(ctx context.Context, m Mission, entry gwclient.ResolvedRouteEntry, workRoot, rdir string, authMode executor.AuthMode, st *pollState, start time.Time, exitCode int) (WorkerVerdict, string, error) {
+// a forced RETRY (the returned reason is its note), EXCEPT auth failure
+// and sandbox-unreachable cases, which return an error instead since
+// retrying the same entry is futile. An extra exec reads stderr.log's
+// tail only on this path (exit != 0, no result) to check for
+// auth-failure signatures.
+func (r *delegatedRunner) finishNoResult(ctx context.Context, m Mission, run cliRun, workRoot, rdir string, st *pollState, start time.Time, exitCode int) (string, error) {
 	stderrTail := r.readStderrTail(ctx, m.ID, m.Environment, workRoot, rdir)
 	reason := fmt.Sprintf("executor exited (code %d) without a result event", exitCode)
 	if exitCode == -1 {
@@ -1103,24 +1520,24 @@ func (r *delegatedRunner) finishNoResult(ctx context.Context, m Mission, entry g
 	// own reason so the UI and canary can tell it from a crash.
 	if exitCode == runBudgetExitCode {
 		reason = "executor exceeded the run budget and was killed"
-		r.recordDied(ctx, m.ID, "run_budget", &exitCode, stderrTail)
-		r.recordLedger(ctx, m, entry, authMode, nil, start, false, "", st.reportedModel)
-		r.coolDown(m.Harness, entry)
-		return forcedRetryVerdict(reason), st.textBuf.String(), nil
+		r.recordDied(ctx, m.ID, run.phase, "run_budget", &exitCode, stderrTail)
+		r.recordLedger(ctx, m, run, nil, start, false, "", st.reportedModel)
+		r.coolDown(run.harness, run.entry)
+		return reason, nil
 	}
 
 	if exitCode != 0 && isAuthFailure(stderrTail) {
-		r.coolDown(m.Harness, entry)
-		r.recordDied(ctx, m.ID, "auth_failed", &exitCode, stderrTail)
-		r.recordLedger(ctx, m, entry, authMode, nil, start, false, errorCodeAuthFailed, st.reportedModel)
-		r.recordAuthFailed(ctx, m.ID, m.Harness)
-		return WorkerVerdict{}, st.textBuf.String(), fmt.Errorf("%w: %s", ErrExecutorAuth, stderrTail)
+		r.coolDown(run.harness, run.entry)
+		r.recordDied(ctx, m.ID, run.phase, "auth_failed", &exitCode, stderrTail)
+		r.recordLedger(ctx, m, run, nil, start, false, errorCodeAuthFailed, st.reportedModel)
+		r.recordAuthFailed(ctx, m.ID, run.phase, run.harness)
+		return "", fmt.Errorf("%w: %s", ErrExecutorAuth, stderrTail)
 	}
 
-	r.recordDied(ctx, m.ID, "transport_death", &exitCode, stderrTail)
-	r.recordLedger(ctx, m, entry, authMode, nil, start, false, "", st.reportedModel)
-	r.coolDown(m.Harness, entry)
-	return forcedRetryVerdict(reason), st.textBuf.String(), nil
+	r.recordDied(ctx, m.ID, run.phase, "transport_death", &exitCode, stderrTail)
+	r.recordLedger(ctx, m, run, nil, start, false, "", st.reportedModel)
+	r.coolDown(run.harness, run.entry)
+	return reason, nil
 }
 
 // readStderrTail fetches the last ~2KB of stderr.log — a single extra
@@ -1162,14 +1579,14 @@ func isAuthFailure(text string) bool {
 // carries the prompt substitution placeholder only ("@PROMPT@"), never
 // the rendered prompt text, and env values are never recorded, only
 // names.
-func (r *delegatedRunner) recordSpawned(ctx context.Context, missionID, harness string, entry gwclient.ResolvedRouteEntry, runID, rdir string, authMode executor.AuthMode, decision resumeDecision) {
+func (r *delegatedRunner) recordSpawned(ctx context.Context, missionID string, run cliRun, runID, rdir string, decision resumeDecision) {
 	if r.events == nil {
 		return
 	}
 	payload := map[string]any{
-		"harness": harness, "provider": entry.ProviderName, "model": entry.Model,
-		"auth_mode": string(authMode), "run_id": runID, "run_dir": rdir,
-		"resumed": decision.resume,
+		"harness": run.harness, "provider": run.entry.ProviderName, "model": run.entry.Model,
+		"auth_mode": string(run.authMode), "run_id": runID, "run_dir": rdir,
+		"resumed": decision.resume, "phase": run.phase,
 	}
 	if decision.resume {
 		payload["session_id"] = decision.sessionID
@@ -1185,20 +1602,20 @@ func (r *delegatedRunner) recordSpawned(ctx context.Context, missionID, harness 
 // time its stream reports a CLI session/thread id (D-103, issue #499).
 // Guarded by st.sessionRecorded so a run's later KindSystem-shaped noise
 // (there is none today, but the guard costs nothing) never double-writes.
-func (r *delegatedRunner) recordSessionSeen(ctx context.Context, missionID, runID string, st *pollState) {
+func (r *delegatedRunner) recordSessionSeen(ctx context.Context, missionID, phase, runID string, st *pollState) {
 	if r.events == nil || st.sessionRecorded {
 		return
 	}
 	st.sessionRecorded = true
 	r.recordEventForce(ctx, missionID, "executor.session", map[string]any{
-		"run_id": runID, "session_id": st.sessionID,
+		"run_id": runID, "session_id": st.sessionID, "phase": phase,
 	})
 }
 
 // recordProgressThrottled writes executor.progress at most once per
 // 60s and only when the byte offset actually advanced since the last
 // write — st tracks lastProgress across poll iterations.
-func (r *delegatedRunner) recordProgressThrottled(ctx context.Context, missionID, runID string, st *pollState) {
+func (r *delegatedRunner) recordProgressThrottled(ctx context.Context, missionID, phase, runID string, st *pollState) {
 	if r.events == nil {
 		return
 	}
@@ -1207,7 +1624,7 @@ func (r *delegatedRunner) recordProgressThrottled(ctx context.Context, missionID
 	}
 	st.lastProgress = time.Now()
 	payload := map[string]any{
-		"run_id": runID, "byte_offset": st.offset, "turns": st.turns, "tool_calls": st.toolCalls,
+		"run_id": runID, "byte_offset": st.offset, "turns": st.turns, "tool_calls": st.toolCalls, "phase": phase,
 	}
 	if st.worktree != nil {
 		payload["worktree"] = st.worktree
@@ -1227,11 +1644,11 @@ func (r *delegatedRunner) recordProgressThrottled(ctx context.Context, missionID
 // cost_usd is priced against Anthropic's table and was never booked at
 // all). The UI keys off this to avoid presenting an unbooked number as
 // billed.
-func (r *delegatedRunner) recordResult(ctx context.Context, missionID string, st *pollState, start time.Time, exitCode int, ev executor.Event, parseKind, status string, cliCostTrusted bool) {
+func (r *delegatedRunner) recordResult(ctx context.Context, missionID, phase string, st *pollState, start time.Time, exitCode int, ev executor.Event, parseKind, status string, cliCostTrusted bool) {
 	payload := map[string]any{
 		"status": status, "is_error": ev.Err != "",
 		"duration_ms": time.Since(start).Milliseconds(),
-		"exit_code":   exitCode, "parse": parseKind,
+		"exit_code":   exitCode, "parse": parseKind, "phase": phase,
 	}
 	if len(ev.Denials) > 0 {
 		payload["denials"] = ev.Denials
@@ -1248,8 +1665,8 @@ func (r *delegatedRunner) recordResult(ctx context.Context, missionID string, st
 
 // recordDied writes executor.died with a capped, neutralized stderr
 // tail.
-func (r *delegatedRunner) recordDied(ctx context.Context, missionID, reason string, exitCode *int, stderrTail string) {
-	payload := map[string]any{"reason": reason, "stderr_tail": NeutralizeSlot(truncate(stderrTail, 2000))}
+func (r *delegatedRunner) recordDied(ctx context.Context, missionID, phase, reason string, exitCode *int, stderrTail string) {
+	payload := map[string]any{"reason": reason, "stderr_tail": NeutralizeSlot(truncate(stderrTail, 2000)), "phase": phase}
 	if exitCode != nil {
 		payload["exit_code"] = *exitCode
 	}
@@ -1257,8 +1674,8 @@ func (r *delegatedRunner) recordDied(ctx context.Context, missionID, reason stri
 }
 
 // recordAuthFailed writes executor.auth_failed.
-func (r *delegatedRunner) recordAuthFailed(ctx context.Context, missionID, harness string) {
-	r.recordEventForce(ctx, missionID, "executor.auth_failed", map[string]any{"harness": harness})
+func (r *delegatedRunner) recordAuthFailed(ctx context.Context, missionID, phase, harness string) {
+	r.recordEventForce(ctx, missionID, "executor.auth_failed", map[string]any{"harness": harness, "phase": phase})
 }
 
 // recordSkipped writes executor.skipped — the one persisted record that
@@ -1267,7 +1684,7 @@ func (r *delegatedRunner) recordAuthFailed(ctx context.Context, missionID, harne
 // skip_reasons); nil for unknown_harness, which needs nothing beyond
 // harness+reason.
 func (r *delegatedRunner) recordSkipped(ctx context.Context, missionID, harness, reason string, extra map[string]any) {
-	payload := map[string]any{"harness": harness, "reason": reason}
+	payload := map[string]any{"harness": harness, "reason": reason, "phase": string(PhaseGenerate)}
 	for k, v := range extra {
 		payload[k] = v
 	}
@@ -1357,8 +1774,10 @@ func costSource(entry gwclient.ResolvedRouteEntry, authMode executor.AuthMode, u
 // over entry.Model so a self-paired row's placeholder ("default" on
 // cursor-cli) never stands in for the model that actually ran; blank
 // falls back to entry.Model, which is what every route-resolved
-// harness already agrees on.
-func (r *delegatedRunner) recordLedger(ctx context.Context, m Mission, entry gwclient.ResolvedRouteEntry, authMode executor.AuthMode, usage *executor.Usage, start time.Time, ok bool, errorCode string, reportedModel string) {
+// harness already agrees on. run.route/run.agent label the row: a
+// review run books under reviewerAgent (issue #582) so the D-097 review
+// token ceiling counts it like a native reviewer turn.
+func (r *delegatedRunner) recordLedger(ctx context.Context, m Mission, run cliRun, usage *executor.Usage, start time.Time, ok bool, errorCode string, reportedModel string) {
 	if r.ledger == nil {
 		return
 	}
@@ -1366,13 +1785,13 @@ func (r *delegatedRunner) recordLedger(ctx context.Context, m Mission, entry gwc
 	if !ok {
 		status = "error"
 	}
-	model := entry.Model
+	model := run.entry.Model
 	if reportedModel != "" {
 		model = reportedModel
 	}
 	e := ledger.Entry{
-		Provider: entry.ProviderName, Model: model, Route: workerRoute(m),
-		Agent: "mission-worker", Purpose: "executor", MissionID: m.ID,
+		Provider: run.entry.ProviderName, Model: model, Route: run.route,
+		Agent: run.agent, Purpose: "executor", MissionID: m.ID,
 		LatencyMS: time.Since(start).Milliseconds(), Status: status, ErrorCode: errorCode,
 	}
 	if usage != nil {
@@ -1380,7 +1799,7 @@ func (r *delegatedRunner) recordLedger(ctx context.Context, m Mission, entry gwc
 			InputTokens: int(usage.InputTokens), OutputTokens: int(usage.OutputTokens),
 			CacheReadTokens: int(usage.CacheReadTokens), CacheWriteTokens: int(usage.CacheWriteTokens),
 		}
-		e.Cost, e.Unbilled = costSource(entry, authMode, e.Usage, usage.CostUSD)
+		e.Cost, e.Unbilled = costSource(run.entry, run.authMode, e.Usage, usage.CostUSD)
 	}
 	r.ledger.Record(ctx, e)
 }

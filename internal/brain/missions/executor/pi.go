@@ -54,6 +54,33 @@ const piDefaultAnthropicBaseURL = "https://api.anthropic.com"
 // (spec.ResultSchema is intentionally never passed to pi's argv or env).
 const piVerdictInstruction = " End your final message with a single line containing only a JSON object of the form {\"status\":\"DONE\"|\"RETRY\"|\"BLOCKED\",\"note\":\"...\"} and nothing after it."
 
+// piSchemaInstruction replaces piVerdictInstruction when spec.ResultSchema
+// is set (issue #582): the final line must be one JSON object matching
+// the compact schema appended after it. extractTrailingJSONObject picks
+// that line up exactly as it does the worker verdict.
+const piSchemaInstruction = " End your final message with a single line containing only a JSON object matching this JSON schema, and nothing after it: "
+
+// piReadOnlyTools is the tool list a read-only run gets (issue #582):
+// pi's read/grep/find/ls never write or execute anything.
+const (
+	piTools         = "read,bash,edit,write,grep,find,ls"
+	piReadOnlyTools = "read,grep,find,ls"
+)
+
+// piVerdictSuffix picks the sentinel instruction for spec: the DONE/
+// RETRY/BLOCKED sentence, or the schema-aware one when a ResultSchema is
+// given.
+func piVerdictSuffix(spec InvocationSpec) (string, error) {
+	if spec.ResultSchema == nil {
+		return piVerdictInstruction, nil
+	}
+	compact, err := compactJSON(spec.ResultSchema)
+	if err != nil {
+		return "", fmt.Errorf("executor/pi: result schema: %w", err)
+	}
+	return piSchemaInstruction + compact, nil
+}
+
 // BuildInvocation validates spec and translates it to a pi CLI argv +
 // env. The prompt never rides the argv directly - PromptFile names the
 // path the runner substitutes via `$(cat PromptFile)` at spawn time,
@@ -95,11 +122,23 @@ func (piAdapter) BuildInvocation(spec InvocationSpec) (Invocation, error) {
 		return Invocation{}, fmt.Errorf("executor/pi: unknown wire %q", spec.Wire)
 	}
 
-	system := spec.SystemAppend + piVerdictInstruction
+	suffix, err := piVerdictSuffix(spec)
+	if err != nil {
+		return Invocation{}, err
+	}
+	system := spec.SystemAppend + suffix
+	tools := piTools
+	if spec.ReadOnly {
+		tools = piReadOnlyTools
+	}
 
+	// issue #358: --mode rpc replaces --mode json. rpc mode takes the
+	// prompt as a JSON line on stdin (see PromptCommand), not on argv,
+	// so the @PROMPT@ placeholder is dropped; the runner still writes
+	// PromptFile to disk for the run dir's own record.
 	argv := []string{
 		"pi",
-		"--mode", "json",
+		"--mode", "rpc",
 		"--no-extensions",
 		"--no-skills",
 		"--no-prompt-templates",
@@ -107,10 +146,9 @@ func (piAdapter) BuildInvocation(spec InvocationSpec) (Invocation, error) {
 		"--no-context-files",
 		"--no-session",
 		"--no-approve",
-		"--tools", "read,bash,edit,write,grep,find,ls",
+		"--tools", tools,
 		"--model", "timothy/" + spec.Model,
 		"--append-system-prompt", system,
-		"@PROMPT@", // substituted by the runner via PromptFile
 	}
 
 	agentDir := filepath.Join(filepath.Dir(spec.PromptPath), "pi-agent")
@@ -147,6 +185,37 @@ func (piAdapter) BuildInvocation(spec InvocationSpec) (Invocation, error) {
 		PromptFile: spec.PromptPath,
 		Files:      map[string]string{"pi-agent/models.json": string(models)},
 	}, nil
+}
+
+// piRPCCommand is one rpc-mode stdin command's wire shape: {"type":
+// "prompt"|"steer", "message": "..."} (issue #358). json.Marshal
+// handles quote/newline escaping, so PromptCommand/SteerCommand never
+// need to think about shell or JSON quoting themselves.
+type piRPCCommand struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+// PromptCommand implements Steerer: the one stdin line that starts a
+// rpc-mode run with prompt.
+func (piAdapter) PromptCommand(prompt string) string {
+	return piMarshalRPCCommand("prompt", prompt)
+}
+
+// SteerCommand implements Steerer: the one stdin line that queues note
+// for the currently running agent, delivered as a user message after
+// the current tool calls finish and before the next LLM call.
+func (piAdapter) SteerCommand(note string) string {
+	return piMarshalRPCCommand("steer", note)
+}
+
+// piMarshalRPCCommand marshals a piRPCCommand; json.Marshal on a
+// struct with only string fields never errors, so the error is
+// discarded rather than threaded through Steerer's error-free
+// signature.
+func piMarshalRPCCommand(kind, message string) string {
+	b, _ := json.Marshal(piRPCCommand{Type: kind, Message: message})
+	return string(b)
 }
 
 // piModelsConfig/piProviderConfig/piModelConfig mirror pi's models.json
@@ -313,9 +382,10 @@ func (p *piParser) ParseLine(line []byte) (Event, bool) {
 		return p.buildTerminalEvent(a), true
 
 	default:
-		// message_start, message_update, turn_*, queue_update,
-		// compaction_*, agent_start, auto_retry_*, and any future type -
-		// all noise the harness never acts on.
+		// message_start, message_update, turn_*, queue_update, response
+		// (rpc mode's per-command ack, issue #358), compaction_*,
+		// agent_start, auto_retry_*, and any future type - all noise the
+		// harness never acts on.
 		p.stats.Unknown++
 		return Event{}, false
 	}

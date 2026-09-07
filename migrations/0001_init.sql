@@ -682,6 +682,11 @@ CREATE TABLE IF NOT EXISTS missions (
     -- settings at dispatch. "" is native; "claude-cli" (etc) names a
     -- registered delegated executor (internal/brain/missions/executor).
     harness               text NOT NULL DEFAULT '',
+    -- ReviewHarness (issue #582) names the registered executor the
+    -- prove phase's review round runs as a read-only delegated CLI;
+    -- "" keeps the native gateway reviewer, which every delegated
+    -- failure also falls back to.
+    review_harness        text NOT NULL DEFAULT '',
     -- Mission worker turns run through loop.Agent same as chat, but
     -- tool-call bookkeeping (session_events, tools audit) hard-requires
     -- a real session_id uuid FK -- a mission has no chat session of its
@@ -744,15 +749,14 @@ CREATE TABLE IF NOT EXISTS missions (
     -- destinations replaces the five separate columns issue #480
     -- dropped (destination_ids, on_complete, branch_pattern,
     -- commit_style, promote_kb_collection_id): a jsonb array of
-    -- entries, each {"destination": <kind>, "destination_id": <uuid>?,
+    -- entries, each {"destination": <kind>?, "destination_id": <uuid>?,
     -- ...per-kind fields, "delivered_at"?, "error"?}
-    -- (missions.DestinationEntry). "email"/"webhook"/"telegram" entries
-    -- carry destination_id, naming an operator-owned destinations table
-    -- row; "kb" carries collection_id (D-081); "github" carries the
-    -- operator's consent-at-create push automation (connector_id,
-    -- repo_url, mode "push"/"push_pr", optional branch_pattern/
-    -- commit_style overriding the settings-configured git strategy
-    -- defaults). delivered_at/error are the result phase's own
+    -- (missions.DestinationEntry). "kb" carries collection_id (D-081);
+    -- every other entry names an operator-owned destinations table row
+    -- via destination_id, including "github" (issue #561): its git
+    -- strategy (connector_id, mode, branch_pattern, commit_style) lives
+    -- on the destinations row instead, and the entry itself only
+    -- overrides repo_url. delivered_at/error are the result phase's own
     -- delivery-state record (driver.go's runResult,
     -- destinations.Deliverer, D-086), written back per entry. Never
     -- model-decided: api/missions.go's create validates every
