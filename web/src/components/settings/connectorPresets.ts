@@ -14,7 +14,7 @@ export interface ConnectorPreset {
   // mcp, github: PAT/bearer token input copy
   tokenPlaceholder?: string
   tokenHint?: string
-  // github: link rendered after tokenHint (e.g. "Create one on GitHub")
+  // github, mcp: link rendered after tokenHint (e.g. "Create one on GitHub")
   tokenURL?: string
   // google, microsoft: OAuth scopes this preset requests
   scopes?: string[]
@@ -94,6 +94,22 @@ export const connectorPresets: ConnectorPreset[] = [
     tokenHint:
       'Fine-grained personal access token — grant Contents (read and write) and Pull requests on the repositories Timothy may work with.',
     tokenURL: 'https://github.com/settings/personal-access-tokens/new',
+  },
+  // One preset for the whole Atlassian MCP server rather than one per
+  // product: matchesPreset resolves an mcp connector by endpoint prefix,
+  // so presets sharing this endpoint could not be told apart and a
+  // Jira-only connector would render as whichever sorted first.
+  {
+    id: 'atlassian',
+    name: 'Atlassian',
+    kind: 'mcp',
+    description: 'Jira, Confluence, and Bitbucket, via MCP',
+    logo: 'atlassian',
+    brandColor: '#0052CC',
+    endpoint: 'https://mcp.atlassian.com/v2/mcp',
+    tokenPlaceholder: 'ATATT…',
+    tokenHint: 'An Atlassian API token, sent as a bearer token.',
+    tokenURL: 'https://id.atlassian.com/manage-profile/security/api-tokens',
   },
   {
     id: 'imap',

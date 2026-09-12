@@ -205,6 +205,14 @@ describe('ConnectorAdd mcp endpoint field', () => {
     // Editing after a passing test invalidates it: Add is gated again.
     expect((screen.getByRole('button', { name: 'Add connector' }) as HTMLButtonElement).disabled).toBe(true)
   })
+
+  it('pre-fills the atlassian endpoint and its api-token copy', async () => {
+    renderPage('atlassian')
+
+    expect(await screen.findByPlaceholderText('ATATT…')).toBeInTheDocument()
+    expect(screen.getByDisplayValue('https://mcp.atlassian.com/v2/mcp')).toBeInTheDocument()
+    expect(screen.getByPlaceholderText('atlassian')).toBeInTheDocument()
+  })
 })
 
 describe('ConnectorAdd auth-error handling', () => {
