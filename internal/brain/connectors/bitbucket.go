@@ -60,9 +60,8 @@ type bitbucketSource struct {
 	client        *http.Client
 }
 
-// Tools is the read-only pull request surface; it lands in
-// bitbucket_tools.go, so a source built before that serves none.
-func (s *bitbucketSource) Tools() []*tools.Tool { return nil }
+// Tools is the read-only pull request surface (bitbucket_tools.go).
+func (s *bitbucketSource) Tools() []*tools.Tool { return s.prTools() }
 
 // AccountInfo reports the kind and, since the token's account is only
 // known after a network call, no email: the aggregated description
