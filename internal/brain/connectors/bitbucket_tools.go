@@ -13,34 +13,21 @@ import (
 	"github.com/SumonMSelim/timothy/internal/brain/tools"
 )
 
-// Pull request read tools on the bitbucket kind (issue #656), the
-// Bitbucket Cloud twin of github_tools.go: the same four names with
-// byte-identical schemas and descriptions, so the manager aggregates
-// the two kinds under one raw name with an account parameter (see
-// TestSharedToolSchemasMatchAcrossKinds). Every tool is a pure GET with
-// the connector's token resolved at call time, and is marked ReadOnly
-// so a mission turn can use it. Writes (comment, approve, merge) have no
-// tool here: chat reaches them through the Atlassian MCP connector,
-// missions through destinations.
+// Read-only PR tools on the bitbucket kind, the twin of github_tools.go: same
+// names, schemas and descriptions so the two kinds aggregate under one raw
+// name. All pure GETs, all ReadOnly so missions can use them.
 const (
 	bitbucketPRListDefault = 10
 	bitbucketPRListMax     = 50
-	// bitbucketDiffMaxBytes caps get_pull_request_diff's body before it
-	// reaches the loop's own result cap, so a huge diff is cut with an
-	// explicit marker instead of silently.
+	// diff cap, cut with a marker instead of silently
 	bitbucketDiffMaxBytes = 200 << 10
-	// bitbucketCommentsPageLen is the page size for comments; one extra
-	// `next` page is followed so a long review thread is not cut at one
-	// page while an endless one cannot hang the call.
+	// comments page size; one extra page is followed
 	bitbucketCommentsPageLen = 100
 )
 
-// bitbucketRepoArg matches the "workspace/slug" form every PR tool
-// takes: the same character set as githubRepoArg, kept separate so the
-// error names Bitbucket's terms.
+// bitbucketRepoArg matches the "workspace/slug" form every PR tool takes.
 var bitbucketRepoArg = regexp.MustCompile(`^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$`)
 
-// splitBitbucketRepoArg validates a "workspace/slug" argument.
 func splitBitbucketRepoArg(repo string) (workspace, slug string, err error) {
 	m := bitbucketRepoArg.FindStringSubmatch(strings.TrimSpace(repo))
 	if m == nil {
@@ -49,15 +36,12 @@ func splitBitbucketRepoArg(repo string) (workspace, slug string, err error) {
 	return m[1], m[2], nil
 }
 
-// prTools is the bitbucket kind's read-only tool surface.
 func (s *bitbucketSource) prTools() []*tools.Tool {
 	return []*tools.Tool{s.listPullRequests(), s.getPullRequest(), s.getPullRequestDiff(), s.listPullRequestComments()}
 }
 
-// bitbucketPullRequest is the subset of a pull request object the read
-// tools render. Bitbucket states are upper-case (OPEN, MERGED,
-// DECLINED, SUPERSEDED) and the object carries no commit or line
-// counts; get_pull_request reads those from the diffstat endpoint.
+// States are upper-case (OPEN, MERGED, DECLINED, SUPERSEDED). No line counts
+// on the object; get_pull_request reads those from diffstat.
 type bitbucketPullRequest struct {
 	ID          int    `json:"id"`
 	Title       string `json:"title"`
@@ -90,15 +74,12 @@ type bitbucketPullRequest struct {
 	} `json:"links"`
 }
 
-// bitbucketDiffstat is one changed file from the diffstat endpoint.
 type bitbucketDiffstat struct {
 	LinesAdded   int `json:"lines_added"`
 	LinesRemoved int `json:"lines_removed"`
 }
 
-// bitbucketComment is one comment on a pull request; Inline is null for
-// conversation comments and carries the file and new-side line for
-// review comments. Deleted comments stay in the listing with a flag.
+// Inline is null for conversation comments. Deleted ones stay listed with a flag.
 type bitbucketComment struct {
 	ID        int64  `json:"id"`
 	CreatedOn string `json:"created_on"`
@@ -116,8 +97,6 @@ type bitbucketComment struct {
 	} `json:"inline"`
 }
 
-// bitbucketAuthor renders an author the way github's tools render a
-// login: the account handle, falling back to the display name.
 func bitbucketAuthor(nickname, displayName string) string {
 	if nickname != "" {
 		return nickname
@@ -125,8 +104,6 @@ func bitbucketAuthor(nickname, displayName string) string {
 	return displayName
 }
 
-// bitbucketPRState lower-cases Bitbucket's state for the model, with
-// draft taking precedence the way github's renderer treats it.
 func bitbucketPRState(pr bitbucketPullRequest) string {
 	if pr.Draft && pr.State == "OPEN" {
 		return "draft"
@@ -166,8 +143,7 @@ func (s *bitbucketSource) listPullRequests() *tools.Tool {
 			if in.MaxResults > bitbucketPRListMax {
 				in.MaxResults = bitbucketPRListMax
 			}
-			// Bitbucket filters by repeating the state parameter; "closed"
-			// is everything that is no longer open.
+			// Bitbucket filters by repeating the state param.
 			var states string
 			switch in.State {
 			case "open":
@@ -216,9 +192,7 @@ func (s *bitbucketSource) getPullRequest() *tools.Tool {
 			fmt.Fprintf(&b, "#%d %s\n", pr.ID, pr.Title)
 			fmt.Fprintf(&b, "author: %s\nstate: %s\n", bitbucketAuthor(pr.Author.Nickname, pr.Author.DisplayName), bitbucketPRState(pr))
 			fmt.Fprintf(&b, "head: %s (%s)\nbase: %s\n", pr.Source.Branch.Name, pr.Source.Commit.Hash, pr.Destination.Branch.Name)
-			// The PR object carries no counts; the diffstat endpoint does.
-			// Its failure degrades to a note rather than failing a read that
-			// already succeeded.
+			// counts come from diffstat; its failure degrades to a note
 			var stat bitbucketPage[bitbucketDiffstat]
 			if err := s.getJSON(ctx, base+"/diffstat", "get pull request diffstat", &stat); err != nil {
 				fmt.Fprintf(&b, "(diffstat unavailable: %v)\n", err)
@@ -257,10 +231,7 @@ func (s *bitbucketSource) getPullRequestDiff() *tools.Tool {
 			if err != nil {
 				return "", fmt.Errorf("resolve credential_ref %q: %w", s.credentialRef, err)
 			}
-			// The diff endpoint answers 302 to the underlying commit-range
-			// diff on the same host; the client follows it and the bearer
-			// header survives a same-host redirect. The body is text/plain,
-			// so no Accept is sent.
+			// /diff answers 302 to a same-host text/plain diff; the client follows it.
 			url := fmt.Sprintf("%s/repositories/%s/%s/pullrequests/%d/diff", bitbucketAPIBase, workspace, slug, number)
 			resp, err := bitbucketRequestURL(ctx, s.client, token, url, "")
 			if err != nil {
@@ -270,8 +241,7 @@ func (s *bitbucketSource) getPullRequestDiff() *tools.Tool {
 			if resp.StatusCode != http.StatusOK {
 				return "", fmt.Errorf("get pull request diff: %w", bitbucketStatusError(resp))
 			}
-			// Read one byte past the cap so a diff exactly at the cap is
-			// not reported as truncated.
+			// one byte past the cap, so a diff exactly at the cap is not marked truncated
 			body, err := io.ReadAll(io.LimitReader(resp.Body, bitbucketDiffMaxBytes+1))
 			if err != nil {
 				return "", fmt.Errorf("get pull request diff: read response: %w", err)
@@ -303,9 +273,7 @@ func (s *bitbucketSource) listPullRequestComments() *tools.Tool {
 			if err != nil {
 				return "", err
 			}
-			// One endpoint serves both conversation and inline comments,
-			// unlike GitHub's two; read the first page and at most one
-			// more.
+			// one endpoint serves both comment kinds; read at most two pages
 			var all []bitbucketComment
 			next := fmt.Sprintf("%s/repositories/%s/%s/pullrequests/%d/comments?pagelen=%d", bitbucketAPIBase, workspace, slug, number, bitbucketCommentsPageLen)
 			for pages := 0; next != "" && pages < 2; pages++ {
@@ -349,7 +317,6 @@ func (s *bitbucketSource) listPullRequestComments() *tools.Tool {
 	}
 }
 
-// bitbucketPRArgs decodes the shared {repo, number} argument shape.
 func bitbucketPRArgs(args json.RawMessage) (workspace, slug string, number int, err error) {
 	var in struct {
 		Repo   string `json:"repo"`
@@ -368,14 +335,10 @@ func bitbucketPRArgs(args json.RawMessage) (workspace, slug string, number int, 
 	return workspace, slug, in.Number, nil
 }
 
-// getJSON resolves the token, GETs path under bitbucketAPIBase, and
-// decodes a 200 body into out; op prefixes errors the way the other
-// bitbucket helpers do.
 func (s *bitbucketSource) getJSON(ctx context.Context, path, op string, out any) error {
 	return s.getJSONURL(ctx, bitbucketAPIBase+path, op, out)
 }
 
-// getJSONURL is getJSON for an absolute URL — a page's `next` link.
 func (s *bitbucketSource) getJSONURL(ctx context.Context, url, op string, out any) error {
 	token, err := s.resolve(ctx, s.credentialRef)
 	if err != nil {

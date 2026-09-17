@@ -10,9 +10,7 @@ import (
 	"testing"
 )
 
-// bitbucketFakeServer points bitbucketAPIBase at an httptest server for
-// the test's lifetime. Tests that use it mutate the shared var, so none
-// of them run t.Parallel().
+// bitbucketFakeServer swaps bitbucketAPIBase for the test's lifetime; callers must not run in parallel.
 func bitbucketFakeServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(handler)
@@ -139,11 +137,7 @@ func TestFetchBitbucketIdentity(t *testing.T) {
 	}
 }
 
-// TestBitbucketStatusErrorMapping pins the "status + short reason, no
-// raw body" discipline: 401 always gets the fixed reconnect message,
-// a JSON error keeps Bitbucket's message, a plain-text error (Bitbucket
-// 404s are the bare words "Not Found") keeps the trimmed text, and an
-// HTML or unparseable JSON body degrades to the status alone.
+// 401 gets a fixed message, JSON keeps its message, plain text is kept, HTML is dropped.
 func TestBitbucketStatusErrorMapping(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -205,10 +199,7 @@ func TestValidateAcceptsBitbucketKind(t *testing.T) {
 	}
 }
 
-// TestManagerTestIdentityReturnsBitbucketIdentity exercises the seam
-// the API's test endpoint uses: a bitbucket-kind Test resolving to an
-// identity payload through the manager's identifier assertion, with
-// no manager change.
+// The manager's identifier assertion picks up the kind with no manager change.
 func TestManagerTestIdentityReturnsBitbucketIdentity(t *testing.T) {
 	srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -234,9 +225,7 @@ func TestManagerTestIdentityReturnsBitbucketIdentity(t *testing.T) {
 	}
 }
 
-// bitbucketRepoJSON renders one repositories entry in the wire shape
-// the live API returns (verified 2026-09-13): mainbranch may be null,
-// and the https clone link sits beside ssh in links.clone.
+// bitbucketRepoJSON is one repositories entry in the live wire shape.
 func bitbucketRepoJSON(fullName, mainBranch string) map[string]any {
 	entry := map[string]any{
 		"full_name":  fullName,
@@ -305,9 +294,7 @@ func TestFetchBitbucketReposFollowsNext(t *testing.T) {
 	}
 }
 
-// TestFetchBitbucketReposCapsAtMax proves ListRepos stops following
-// `next` once it has bitbucketRepoMaxRepos, even if the remote keeps
-// offering pages — an enormous workspace must not hang the request.
+// ListRepos stops following next at the cap.
 func TestFetchBitbucketReposCapsAtMax(t *testing.T) {
 	full := make([]map[string]any, bitbucketRepoPageLen)
 	for i := range full {
@@ -337,9 +324,7 @@ func TestFetchBitbucketReposStatusError(t *testing.T) {
 	}
 }
 
-// bitbucketSourceWith builds a bitbucket source whose resolver returns
-// the given token or error, for tests that exercise the Source methods
-// rather than the fetch helpers underneath them.
+// bitbucketSourceWith builds a source with a fixed resolver result.
 func bitbucketSourceWith(t *testing.T, client *http.Client, token string, resolveErr error) *bitbucketSource {
 	t.Helper()
 	src, err := BitbucketBuilder(client)(t.Context(), Connector{Name: "bb", Kind: "bitbucket", CredentialRef: "BB_TOKEN"},
@@ -350,9 +335,7 @@ func bitbucketSourceWith(t *testing.T, client *http.Client, token string, resolv
 	return src.(*bitbucketSource)
 }
 
-// TestBitbucketSourceMethods covers Test, Identity and ListRepos through
-// the Source itself: the credential resolve happens there, so a
-// resolver failure must name the ref and never reach the network.
+// Test, Identity and ListRepos through the Source; a failing resolver must not reach the network.
 func TestBitbucketSourceMethods(t *testing.T) {
 	var hits int
 	srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -399,9 +382,7 @@ func TestBitbucketSourceMethods(t *testing.T) {
 	}
 }
 
-// TestBitbucketDecodeErrors pins that a 200 with an unparseable body
-// is reported as a decode failure naming the endpoint, not swallowed
-// as an empty result.
+// A 200 with a bad body is a decode error naming the endpoint, not an empty result.
 func TestBitbucketDecodeErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -444,9 +425,7 @@ func TestBitbucketDecodeErrors(t *testing.T) {
 	}
 }
 
-// TestBitbucketRequestErrors covers the two ways a request fails
-// before any status code exists: an unbuildable URL and a connection
-// refused. Neither may include the token.
+// Request failures before any status code, with the token never echoed.
 func TestBitbucketRequestErrors(t *testing.T) {
 	t.Run("unbuildable URL", func(t *testing.T) {
 		prev := bitbucketAPIBase
@@ -479,9 +458,7 @@ func TestBitbucketStatusErrorTruncatesLongText(t *testing.T) {
 	}
 }
 
-// TestBitbucketEmailRequestError covers the network failure on the
-// second identity call: /user succeeds, the connection dies on
-// /user/emails, and the error surfaces without the token.
+// The connection dying on /user/emails surfaces without the token.
 func TestBitbucketEmailRequestError(t *testing.T) {
 	srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/user" {
@@ -500,9 +477,7 @@ func TestBitbucketEmailRequestError(t *testing.T) {
 	}
 }
 
-// TestFetchBitbucketReposTrimsOversizedLastPage: a page larger than
-// requested (Bitbucket is free to ignore pagelen) can push the total
-// past the cap in one step; the result is trimmed, never over.
+// A page larger than pagelen can overshoot the cap; the result is trimmed.
 func TestFetchBitbucketReposTrimsOversizedLastPage(t *testing.T) {
 	big := make([]map[string]any, 2*bitbucketRepoPageLen)
 	for i := range big {

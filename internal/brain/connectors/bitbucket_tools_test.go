@@ -11,8 +11,7 @@ import (
 	"github.com/SumonMSelim/timothy/internal/brain/tools"
 )
 
-// bitbucketToolsSource builds a bitbucket source against the fake
-// server with a fixed token, returning its tools by name.
+// bitbucketToolsSource builds a source against the fake server and returns its tools by name.
 func bitbucketToolsSource(t *testing.T, handler http.HandlerFunc) map[string]*tools.Tool {
 	t.Helper()
 	bitbucketFakeServer(t, handler)
@@ -259,9 +258,7 @@ func TestBitbucketGetPullRequest(t *testing.T) {
 	}
 }
 
-// TestBitbucketGetPullRequestDiff models the live endpoint: /diff
-// answers 302 to a same-host commit-range diff, which the client
-// follows with the bearer header intact, and the body is text/plain.
+// /diff answers 302 to a same-host text/plain diff; the bearer must survive the redirect.
 func TestBitbucketGetPullRequestDiff(t *testing.T) {
 	small := "diff --git a/x b/x\n+hello\n"
 	big := strings.Repeat("x", bitbucketDiffMaxBytes+500)
@@ -392,9 +389,7 @@ func TestBitbucketListPullRequestComments(t *testing.T) {
 	})
 }
 
-// TestBitbucketPRToolsReachMissions pins the whole point of a native
-// kind: its ReadOnly tools survive the manager's mission filter, which
-// strips every MCP source.
+// The tools survive the manager's mission filter, which strips every MCP source.
 func TestBitbucketPRToolsReachMissions(t *testing.T) {
 	t.Parallel()
 	src, err := BitbucketBuilder(nil)(t.Context(), Connector{Name: "bb", Kind: "bitbucket", CredentialRef: "BB_TOKEN"},
@@ -415,8 +410,7 @@ func TestBitbucketPRToolsReachMissions(t *testing.T) {
 	}
 }
 
-// TestBitbucketPRToolsResolveFailure pins that every tool surfaces a
-// credential resolve failure by ref name and makes no request.
+// Every tool reports a resolve failure by ref name and makes no request.
 func TestBitbucketPRToolsResolveFailure(t *testing.T) {
 	var hits int
 	srv := bitbucketFakeServer(t, func(http.ResponseWriter, *http.Request) { hits++ })
@@ -432,8 +426,7 @@ func TestBitbucketPRToolsResolveFailure(t *testing.T) {
 	}
 }
 
-// TestBitbucketPRArgsRepoShape covers the shared {repo, number} decoder's
-// repo validation, which the per-tool tables reach only for the list tool.
+// The shared {repo, number} decoder rejects a bad repo form.
 func TestBitbucketPRArgsRepoShape(t *testing.T) {
 	t.Parallel()
 	for _, args := range []string{`{"repo":"nope","number":7}`, `{"repo":"a/b/c","number":7}`} {
@@ -485,8 +478,7 @@ func TestBitbucketCommentsInlineWithoutLine(t *testing.T) {
 	}
 }
 
-// TestBitbucketPRToolsRejectBadRepoArg reaches the shared decoder's
-// repo check through the two tools whose tables use fixed arguments.
+// The diff and comments tools reject a bad repo form too.
 func TestBitbucketPRToolsRejectBadRepoArg(t *testing.T) {
 	tls := bitbucketToolsSource(t, func(_ http.ResponseWriter, r *http.Request) { t.Errorf("unexpected request %s", r.URL.Path) })
 	for _, name := range []string{"get_pull_request_diff", "list_pull_request_comments"} {
