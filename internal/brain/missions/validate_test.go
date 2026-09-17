@@ -22,6 +22,11 @@ func withGitHubSource(m Mission, repoURL, connectorID string) Mission {
 	return m
 }
 
+func withBitbucketSource(m Mission, repoURL, connectorID string) Mission {
+	m.Sources = append(m.Sources, SourceEntry{Source: SourceKindBitbucket, RepoURL: repoURL, ConnectorID: connectorID})
+	return m
+}
+
 func TestValidateCreate(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -134,6 +139,37 @@ func TestValidateCreate(t *testing.T) {
 			m.Destinations = []DestinationEntry{{DestinationID: "gh-1", RepoURL: "not-a-url"}}
 			return m
 		}, ValidateDeps{}, true},
+		{"bitbucket source with a bitbucket.org url is accepted", func(m Mission) Mission {
+			m.Kind = "coding"
+			return withBitbucketSource(m, "https://bitbucket.org/ws/repo.git", "bb-1")
+		}, ValidateDeps{}, false},
+		{"bitbucket source with a github url is rejected", func(m Mission) Mission {
+			m.Kind = "coding"
+			return withBitbucketSource(m, "https://github.com/o/r.git", "bb-1")
+		}, ValidateDeps{}, true},
+		{"bitbucket source on general is rejected like github", func(m Mission) Mission {
+			return withBitbucketSource(m, "https://bitbucket.org/ws/repo.git", "bb-1")
+		}, ValidateDeps{}, true},
+		{"repo_url on a bitbucket destination is accepted", func(m Mission) Mission {
+			m.Kind = "coding"
+			m.Destinations = []DestinationEntry{{DestinationID: "bb-1", RepoURL: "https://bitbucket.org/ws/repo"}}
+			return m
+		}, ValidateDeps{DestinationKind: func(ctx context.Context, id string) (string, bool, error) {
+			return "bitbucket", true, nil
+		}}, false},
+		{"github url on a bitbucket destination is rejected", func(m Mission) Mission {
+			m.Kind = "coding"
+			m.Destinations = []DestinationEntry{{DestinationID: "bb-1", RepoURL: "https://github.com/o/r"}}
+			return m
+		}, ValidateDeps{DestinationKind: func(ctx context.Context, id string) (string, bool, error) {
+			return "bitbucket", true, nil
+		}}, true},
+		{"bitbucket destination on general is rejected", func(m Mission) Mission {
+			m.Destinations = []DestinationEntry{{DestinationID: "bb-1"}}
+			return m
+		}, ValidateDeps{DestinationKind: func(ctx context.Context, id string) (string, bool, error) {
+			return "bitbucket", true, nil
+		}}, true},
 		{"empty route", func(m Mission) Mission {
 			m.Route = ""
 			return m

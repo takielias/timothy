@@ -54,6 +54,27 @@ func ParseGitHubRepoURL(repoURL string) (owner, repo string, ok bool) {
 	return m[1], m[2], true
 }
 
+// bitbucketRepoPattern pins the host, unlike githubRepoPattern: a
+// bitbucket connector paired with another host's URL is a misconfiguration.
+var bitbucketRepoPattern = regexp.MustCompile(`^https://bitbucket\.org/([^/]+)/([^/]+?)(?:\.git)?/?$`)
+
+// ParseBitbucketRepoURL extracts workspace/slug from a bitbucket.org https clone URL.
+func ParseBitbucketRepoURL(repoURL string) (workspace, slug string, ok bool) {
+	m := bitbucketRepoPattern.FindStringSubmatch(repoURL)
+	if m == nil {
+		return "", "", false
+	}
+	return m[1], m[2], true
+}
+
+// parseRepoURLForKind picks the parser for a source or destination kind.
+func parseRepoURLForKind(kind, repoURL string) (owner, repo string, ok bool) {
+	if kind == SourceKindBitbucket {
+		return ParseBitbucketRepoURL(repoURL)
+	}
+	return ParseGitHubRepoURL(repoURL)
+}
+
 // PRTitleGoalCap bounds a fallback title built from the goal when the
 // mission has no generated display name yet.
 const PRTitleGoalCap = 72

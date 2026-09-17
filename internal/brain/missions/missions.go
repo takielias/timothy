@@ -326,12 +326,13 @@ func (m Mission) DestinationIDs() []string {
 
 // sourceKind names SourceEntry.Source's known values.
 const (
-	SourceKindGitHub  = "github"
-	SourceKindPDF     = "pdf"
-	SourceKindMission = "mission"
-	SourceKindChat    = "chat"
-	SourceKindKB      = "kb"
-	SourceKindBrief   = "brief"
+	SourceKindGitHub    = "github"
+	SourceKindBitbucket = "bitbucket"
+	SourceKindPDF       = "pdf"
+	SourceKindMission   = "mission"
+	SourceKindChat      = "chat"
+	SourceKindKB        = "kb"
+	SourceKindBrief     = "brief"
 )
 
 // SourceEntry is one input a mission's discover/plan/work prompts draw
@@ -339,8 +340,8 @@ const (
 // attachments/parent_context/referenced_context columns): Source names
 // the kind, the rest of the fields are populated per kind.
 //
-//   - "github": ConnectorID/RepoURL -- the repo this coding mission
-//     clones from instead of self-initializing an empty one.
+//   - "github", "bitbucket": ConnectorID/RepoURL -- the repo this coding
+//     mission clones from instead of self-initializing an empty one.
 //   - "pdf" (legacy kind name, also covers image/audio attachments
 //     since issue #359): Name/Mime/Markdown -- an attached document,
 //     image, or audio clip, ID names an attachments-store row.
@@ -377,31 +378,37 @@ type SourceEntry struct {
 	Digest      string `json:"digest,omitempty"`
 }
 
-// GitHubSource returns this mission's "github" source entry, if any:
-// there is at most one per mission (api/missions.go's create only ever
-// builds one from repo_url/connector_id). ok is false when the mission
-// has none -- the self-init'd empty repo case.
-func (m Mission) GitHubSource() (SourceEntry, bool) {
+// repoSource returns the mission's repo source entry, github or
+// bitbucket; there is at most one per mission.
+func (m Mission) repoSource() (SourceEntry, bool) {
 	for _, e := range m.Sources {
-		if e.Source == SourceKindGitHub {
+		if e.Source == SourceKindGitHub || e.Source == SourceKindBitbucket {
 			return e, true
 		}
 	}
 	return SourceEntry{}, false
 }
 
+// RepoSource is repoSource for callers outside the package.
+func (m Mission) RepoSource() (SourceEntry, bool) { return m.repoSource() }
+
+// GitHubSource returns this mission's "github" source entry, if any.
+func (m Mission) GitHubSource() (SourceEntry, bool) {
+	e, ok := m.repoSource()
+	return e, ok && e.Source == SourceKindGitHub
+}
+
 // RepoURL is the effective repo_url the pre-#481 Mission column used
-// to carry: "" when the mission has no "github" source entry.
+// to carry: "" when the mission has no repo source entry.
 func (m Mission) RepoURL() string {
-	e, _ := m.GitHubSource()
+	e, _ := m.repoSource()
 	return e.RepoURL
 }
 
 // ConnectorID is the effective connector_id the pre-#481 Mission
-// column used to carry: "" when the mission has no "github" source
-// entry.
+// column used to carry: "" when the mission has no repo source entry.
 func (m Mission) ConnectorID() string {
-	e, _ := m.GitHubSource()
+	e, _ := m.repoSource()
 	return e.ConnectorID
 }
 

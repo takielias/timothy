@@ -234,6 +234,46 @@ func TestParseGitHubRepoURL(t *testing.T) {
 	}
 }
 
+func TestParseBitbucketRepoURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		url       string
+		workspace string
+		slug      string
+		wantOK    bool
+	}{
+		{"with .git suffix", "https://bitbucket.org/digital-platforms/bl-balance-ms.git", "digital-platforms", "bl-balance-ms", true},
+		{"without .git suffix", "https://bitbucket.org/ws/repo", "ws", "repo", true},
+		{"trailing slash", "https://bitbucket.org/ws/repo/", "ws", "repo", true},
+		{"github host is rejected", "https://github.com/octocat/hello-world.git", "", "", false},
+		{"ssh form is rejected", "git@bitbucket.org:ws/repo.git", "", "", false},
+		{"no slug", "https://bitbucket.org/ws", "", "", false},
+		{"empty", "", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace, slug, ok := ParseBitbucketRepoURL(tc.url)
+			if ok != tc.wantOK || workspace != tc.workspace || slug != tc.slug {
+				t.Fatalf("ParseBitbucketRepoURL(%q) = (%q, %q, %v), want (%q, %q, %v)", tc.url, workspace, slug, ok, tc.workspace, tc.slug, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestParseRepoURLForKind(t *testing.T) {
+	t.Parallel()
+	if _, _, ok := parseRepoURLForKind(SourceKindBitbucket, "https://github.com/o/r"); ok {
+		t.Fatal("bitbucket kind accepted a github URL")
+	}
+	if o, r, ok := parseRepoURLForKind(SourceKindGitHub, "https://github.com/o/r"); !ok || o != "o" || r != "r" {
+		t.Fatalf("github kind: (%q, %q, %v)", o, r, ok)
+	}
+	if w, s, ok := parseRepoURLForKind(SourceKindBitbucket, "https://bitbucket.org/w/s.git"); !ok || w != "w" || s != "s" {
+		t.Fatalf("bitbucket kind: (%q, %q, %v)", w, s, ok)
+	}
+}
+
 // TestConventionalPRTitle covers the Conventional Commits shape the
 // github destination uses for PR titles (issue #709).
 func TestConventionalPRTitle(t *testing.T) {

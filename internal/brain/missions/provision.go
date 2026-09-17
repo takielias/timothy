@@ -403,11 +403,12 @@ func (p *provisioner) parentPRMerged(ctx context.Context, m, parent Mission) boo
 	if !found || number == 0 {
 		return false
 	}
-	owner, repo, ok := ParseGitHubRepoURL(parent.RepoURL())
+	src, _ := parent.repoSource()
+	owner, repo, ok := parseRepoURLForKind(src.Source, src.RepoURL)
 	if !ok {
 		return false
 	}
-	merged, err := p.resolvePRState(ctx, parent.ConnectorID(), owner, repo, number)
+	merged, err := p.resolvePRState(ctx, src.ConnectorID, owner, repo, number)
 	if err != nil {
 		p.log.Debug("driver: follow-up base ref: pr state resolve failed", "mission_id", m.ID, "parent_id", parent.ID, "error", err)
 		return false
