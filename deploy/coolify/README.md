@@ -2,16 +2,11 @@
 
 [Coolify](https://coolify.io) deploys Timothy as a **Docker Compose**
 resource from a Git source. The stack is nine containers, two networks
-and three volumes, so the single-Dockerfile resource type cannot host it.
+and four volumes, so the single-Dockerfile resource type cannot host it.
 
-The compose is `deploy/release/docker-compose.yml`, the same file the
-installer uses; it pulls the published `ghcr.io/timothy-agent/timothy-*`
-images and builds nothing. It needs Docker Compose 2.23.1 or newer on the
-Coolify host: searxng's settings travel as an inline compose config
-(`configs.content`), the only form that survives Coolify. A relative bind
-is rewritten into Coolify's data directory and `configs.file:` fails with
-`bind source path does not exist: /artifacts/<uuid>/...`, because compose
-runs in a helper container the daemon cannot see.
+`docker-compose.yml` in this directory is `deploy/release/docker-compose.yml`
+adapted for a repo checkout behind Coolify's proxy; it pulls the same
+published `ghcr.io/timothy-agent/timothy-*` images and builds nothing.
 
 ## Before you start
 
@@ -26,25 +21,25 @@ in `brain`'s `depends_on` and run without missions.
 **New Resource → Docker Compose**, Git source pointing at this repository
 (or your fork).
 
-| Field          | Value                                                                  |
-|----------------|------------------------------------------------------------------------|
-| Base Directory | `/deploy/release`                                                      |
-| Compose file   | `docker-compose.yml`                                                   |
-| Branch         | a release tag (a compose from `main` with images from a tag can drift) |
+| Field | Value |
+|-------|-------|
+| Base Directory | `/deploy/coolify` |
+| Compose file | `docker-compose.yml` |
+| Branch | `main`, or a release tag |
 
 ## 2. Environment variables
 
 Compose interpolation fails the deployment outright without the first
 three:
 
-| Variable             | Value                                                             |
-|----------------------|-------------------------------------------------------------------|
-| `TIMOTHY_VERSION`    | Newest release tag without the leading `v`, e.g. `0.1.0-alpha.69` |
-| `POSTGRES_PASSWORD`  | `openssl rand -hex 24`                                            |
-| `TIMOTHY_MASTER_KEY` | `openssl rand -base64 32`                                         |
-| `TIMOTHY_API_TOKEN`  | `openssl rand -hex 32`                                            |
-| `TIMOTHY_PUBLIC_URL` | The public HTTPS URL, e.g. `https://timothy.example.com`          |
-| `DOCKER_SOCK_GID`    | `stat -c '%g' /var/run/docker.sock` on the Coolify host           |
+| Variable | Value |
+|----------|-------|
+| `TIMOTHY_VERSION` | Newest release tag without the leading `v`, e.g. `0.1.0-alpha.69` |
+| `POSTGRES_PASSWORD` | `openssl rand -hex 24` |
+| `TIMOTHY_MASTER_KEY` | `openssl rand -base64 32` |
+| `TIMOTHY_API_TOKEN` | `openssl rand -hex 32` |
+| `TIMOTHY_PUBLIC_URL` | The public HTTPS URL, e.g. `https://timothy.example.com` |
+| `DOCKER_SOCK_GID` | `stat -c '%g' /var/run/docker.sock` on the Coolify host |
 
 `TIMOTHY_PUBLIC_URL` builds the connector OAuth redirect; that URL plus
 `/v1/connectors/oauth/callback` is what goes in the Google OAuth client's
@@ -66,10 +61,9 @@ unrecoverable.
 
 ## 3. Domain
 
-Assign the domain to the **`web`** service, port 8080. `web`'s nginx proxies
-`/v1` to `brain` on the internal network. The compose also publishes
-`WEB_PORT` (3300) and `BRAIN_PORT` (8300) on the host, as it does for a flat
-install; set both in the environment if those ports are taken.
+Assign the domain to the **`web`** service, port 8080. Nothing else is
+reachable from outside: `web`'s nginx proxies `/v1` to `brain` on the
+internal network, and no service publishes a host port.
 
 ## 4. Mission sandbox image
 
@@ -88,7 +82,7 @@ upgrade.
 
 ```sh
 # searxng got its inline config (1 = the json format search_web needs)
-docker exec <searxng-container> grep -c json /usr/local/searxng/settings.yml
+docker exec <searxng-container> grep -c json /etc/searxng/settings.yml
 
 # proxy is routing to web
 curl -sI https://<domain>/ | head -1
