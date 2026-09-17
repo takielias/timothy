@@ -206,7 +206,8 @@ func (p *provisioner) ensureProvisionedLocked(ctx context.Context, m Mission) (M
 		branchPattern := p.githubBranchPattern(ctx, m)
 		baseRef := p.followUpBaseRef(ctx, m)
 		m = p.nameBeforeBranch(ctx, m)
-		workspace, worktree, branch, baseCommit, baseUsed, err := p.workspace.Provision(ctx, m.ID, m.Goal, m.Name, m.Kind, repoURL, token, connIdentity, branchPattern, baseRef)
+		src, _ := m.repoSource()
+		workspace, worktree, branch, baseCommit, baseUsed, err := p.workspace.Provision(ctx, m.ID, m.Goal, m.Name, m.Kind, repoURL, token, connIdentity, branchPattern, baseRef, src.Source)
 		if err != nil {
 			return m, fmt.Errorf("provision: %w", err)
 		}

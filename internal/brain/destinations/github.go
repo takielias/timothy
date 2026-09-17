@@ -45,7 +45,7 @@ type PRSource interface {
 // path (issue #483): pointing the worktree's origin at a repo the
 // mission was never cloned from before Push/OpenPR use it.
 type pusher interface {
-	Push(ctx context.Context, worktree, branch, token string) (string, error)
+	Push(ctx context.Context, worktree, branch, token, hostKind string) (string, error)
 	SetOrigin(ctx context.Context, worktree, remoteURL string) error
 }
 
@@ -91,7 +91,8 @@ func NewGitHubAdapter(p pusher, e events, resolveToken PushTokenResolver, pr PRS
 // driver's auto-fire hook use, so the Timeline reads identically
 // regardless of which one fired.
 func (a *GitHubAdapter) PushBranch(ctx context.Context, m missions.Mission, token string) (host string, err error) {
-	host, pushErr := a.Pusher.Push(ctx, m.WorktreePath(), m.Branch, token)
+	src, _ := m.RepoSource()
+	host, pushErr := a.Pusher.Push(ctx, m.WorktreePath(), m.Branch, token, src.Source)
 	if pushErr != nil {
 		reason := "push failed"
 		switch {

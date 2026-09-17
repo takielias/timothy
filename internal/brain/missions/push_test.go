@@ -75,7 +75,7 @@ func TestRawPushScrubsTokenFromError(t *testing.T) {
 	root := t.TempDir()
 	missing := filepath.Join(root, "does-not-exist")
 	const token = "super-secret-token-value"
-	err := rawPush(context.Background(), missing, "main", token)
+	err := rawPush(context.Background(), missing, "main", token, "")
 	if err == nil {
 		t.Fatal("rawPush against a nonexistent directory should fail")
 	}
@@ -110,7 +110,7 @@ func TestRawPushHappyPath(t *testing.T) {
 	gitRun(t, workdir, "-c", "user.name=test", "-c", "user.email=test@test", "commit", "-q", "-m", "add file")
 	branch := strings.TrimSpace(gitRun(t, workdir, "rev-parse", "--abbrev-ref", "HEAD"))
 
-	if err := rawPush(context.Background(), workdir, branch, "dummy-token"); err != nil {
+	if err := rawPush(context.Background(), workdir, branch, "dummy-token", ""); err != nil {
 		t.Fatalf("rawPush: %v", err)
 	}
 
@@ -318,5 +318,69 @@ func TestPRTitleFallsBackToTruncatedGoal(t *testing.T) {
 	got := PRTitle(long)
 	if len(got) != PRTitleGoalCap+len("…") || !strings.HasSuffix(got, "…") {
 		t.Fatalf("PRTitle with a long goal and no name = %q (len %d), want truncated to %d chars + ellipsis", got, len(got), PRTitleGoalCap)
+	}
+}
+
+// The helper is a shell snippet git runs; execute it through a real /bin/sh
+// and read what it prints, per host kind. The token must only ever come from
+// the environment.
+func TestGitCredentialHelperRoundTrip(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ kind, wantUser string }{
+		{"", "x-access-token"},
+		{SourceKindGitHub, "x-access-token"},
+		{SourceKindBitbucket, "x-token-auth"},
+	} {
+		t.Run("kind="+tc.kind, func(t *testing.T) {
+			t.Parallel()
+			helper := gitCredentialHelper(tc.kind, "GIT_TEST_TOKEN")
+			if strings.Contains(helper, "tok-value") {
+				t.Fatalf("token leaked into the helper string: %s", helper)
+			}
+			// git strips the leading "!" before handing the rest to the shell
+			cmd := exec.Command("/bin/sh", "-c", strings.TrimPrefix(helper, "!")) //nolint:gosec // the composed helper is the thing under test
+			cmd.Env = append(os.Environ(), "GIT_TEST_TOKEN=tok-value")
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("sh: %v: %s", err, out)
+			}
+			want := "username=" + tc.wantUser + "\npassword=tok-value\n"
+			if string(out) != want {
+				t.Fatalf("helper printed %q, want %q", out, want)
+			}
+		})
+	}
+}
+
+// A bitbucket push against a local bare remote must succeed with the
+// x-token-auth helper in place: the remote ignores credentials, so this
+// proves the composed command still runs end to end for the second kind.
+func TestRawPushBitbucketKind(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	bare := t.TempDir()
+	if out, err := exec.Command("git", "init", "--bare", "-q", bare).CombinedOutput(); err != nil { //nolint:gosec // test-only temp dir
+		t.Fatalf("init bare: %v: %s", err, out)
+	}
+	wt := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "t@example.com"},
+		{"config", "user.name", "t"},
+		{"remote", "add", "origin", bare},
+		{"commit", "--allow-empty", "-q", "-m", "init"},
+		{"checkout", "-q", "-b", "feat/x"},
+		{"commit", "--allow-empty", "-q", "-m", "work"},
+	} {
+		if out, err := runGit(ctx, wt, args...); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	if err := rawPush(ctx, wt, "feat/x", "unused-token", SourceKindBitbucket); err != nil {
+		t.Fatalf("rawPush: %v", err)
+	}
+	out, err := exec.Command("git", "-C", bare, "branch", "--list", "feat/x").CombinedOutput() //nolint:gosec // test-only temp dir
+	if err != nil || !strings.Contains(string(out), "feat/x") {
+		t.Fatalf("branch not on remote: %v: %s", err, out)
 	}
 }
