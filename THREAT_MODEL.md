@@ -148,25 +148,33 @@ no-new-privileges, distroless, network-isolated. Its API never accepts
 container names, images, mounts, or arbitrary env; the mission ID is
 shape-validated before any Docker call. Mission containers run as an
 unprivileged user with capped memory, CPU, PIDs, and OOM sacrifice bias,
-a deny-by-default env allowlist, and value-length limits. Shell commands
-are scored by a classifier that treats anything it cannot parse
+a deny-by-default env allowlist, and value-length limits. Their rootfs is
+read-only (D-106), with writable space only on the workspace volume, the
+executor state volume, and size-bounded tmpfs at `/tmp` and the sandbox
+HOME; nofile and fsize ulimits bound fd and single-file-size exhaustion,
+and Docker's default seccomp profile applies, pinned by never setting a
+`seccomp=` security option. Shell commands are
+scored by a classifier that treats anything it cannot parse
 (substitutions, `eval`, `sh -c`) as destructive and prompts. `write_file`
 resolves symlinks before writing and rejects paths outside the workspace.
 Mission file downloads force octet-stream with nosniff and collapse
 not-found and out-of-bounds into the same 404.
 
 - **Mitigated:** sandboxd hardening, narrow unauthenticated-but-
-  unreachable API, per-mission resource caps, env allowlist, symlink-safe
-  writes, download containment.
+  unreachable API, per-mission resource caps, read-only rootfs with
+  bounded tmpfs, nofile/fsize ulimits, default seccomp profile, env
+  allowlist, symlink-safe writes, download containment.
 - **Accepted:** the shell classifier is a best-effort regex, not a
   boundary; the container is the boundary. Stated in code and here.
-- **Open:** mission containers lack read-only rootfs, pinned seccomp, and
-  ulimits, and share one read-write workspace volume across missions, so
-  missions are not isolated from each other's files. Sandbox containers on
-  the default bridge can reach host-published ports (including brain's
-  `:8300`, whose unauthenticated `/metrics` is then reachable); the token
-  is never given to the sandbox, so this is defense-in-depth. Tracked in
-  issue #437.
+- **Open:** mission containers share one read-write workspace volume
+  across missions, so missions are not isolated from each other's files
+  (issue #749). Sandbox containers on the default bridge reach the bridge
+  gateway address (typically `172.17.0.1`) and through it any port the
+  host publishes, including brain's `:8300`; the API token is never given
+  to the sandbox, so this is defense-in-depth rather than an open door.
+  Replacing bridge networking is not planned; the containment boundary is
+  the container, and outbound internet access is a requirement (a coding
+  mission runs `pip install` / `npm install`). Tracked in issue #437.
 
 ### Sidecars
 
@@ -209,18 +217,41 @@ transcripts, memories, and KB content are plaintext in the volume.
 
 - **Accepted for now:** no database-level encryption at rest. Single-
   operator, single-host; the mitigation is host access control.
-- **Open:** no backup tooling or restore doc in the repo, against an
-  append-only full-transcript store. Tracked in issue #436.
+- **Mitigated:** `scripts/backup-db.sh` writes rotated, gzipped
+  whole-database dumps outside the `pgdata` volume (cron-able, and it
+  refuses a dump missing the `secrets` table); the restore procedure is
+  in README.md under "Restoring onto a fresh host". Issue #436.
+- **Accepted for now:** running the backup on a schedule and keeping a
+  copy off-host is the operator's responsibility; the repo ships the
+  tooling, not the cron entry. `TIMOTHY_MASTER_KEY` must be backed up
+  separately or the dump's secrets stay unreadable.
 
 ### Build and release
 
 Images publish to GHCR with per-job scoped write permissions. The release
-compose digest-pins the one third-party image (searxng).
+compose digest-pins both third-party images (searxng, postgres). Every
+freshly built image carries a GitHub build provenance attestation pushed
+to the registry alongside it, verifiable with `gh attestation verify
+oci://ghcr.io/timothy-agent/timothy-<service>:<version> --repo
+timothy-agent/timothy`. Release notes carry SHA-256 checksums for the
+published compose and env assets, and `install.sh` downloads them into a
+temp dir, verifies them against the release's `checksums.txt`, and
+refuses to install on a mismatch.
 
-- **Open:** Timothy images and postgres are pinned by mutable tag; there
-  is no image signing, provenance, or SBOM; `install.sh` downloads release
-  assets without checksum verification (secrets it generates locally use a
-  CSPRNG with adequate entropy). Tracked in issue #435.
+- **Mitigated:** third-party image digest pins, build provenance
+  attestations on published images, checksummed release assets verified
+  by the installer before use. Issue #435.
+- **Accepted:** Timothy's own images stay tagged by version in the
+  release compose rather than digest-pinned, because the tag is
+  published by this repo's own workflow and every digest is attested;
+  digest-pinning them would mean rewriting the compose file per release
+  for no added guarantee. `checksums.txt` is served by the same GitHub
+  release as the assets, so it binds an asset to its release, not to a
+  signing key; it stops a truncated or swapped asset, not a compromised
+  GitHub account. `install.sh` itself is unverified at fetch time (it is
+  the verifier).
+- **Open:** no SBOM is generated per image. Future work, scoped out of
+  #435.
 
 ## Open-risk summary
 
@@ -231,8 +262,7 @@ compose digest-pins the one third-party image (searxng).
 | No CSP/frame headers; token in localStorage; mermaid SVG path | Medium | #432 |
 | Secret-store AES-GCM without AAD | Medium | #433 |
 | Sidecar input limits, Typst timeout, resource caps | Medium | #434 |
-| Release integrity (signing, digest pins, checksums) | Medium | #435 |
-| No DB backup tooling or restore doc | Medium | #436 |
+| No per-image SBOM (rest of release integrity mitigated) | Low | #435 |
 | Mission sandbox hardening round 2 | Low | #437 |
 | Unauthenticated `/metrics` on the public port | Low | #438 |
 
