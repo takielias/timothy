@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"strings"
 	"sync"
 	"syscall"
@@ -269,6 +270,7 @@ func main() {
 	var resolveSecret func(context.Context, string) (string, error)
 	if secrets != nil {
 		resolveSecret = secrets.Resolve
+		go runSecretResealSweep(ctx, app.DB, secrets, app.Log)
 	}
 
 	conns, goog, msft, markItDownURL := buildConnectors(app.DB, secrets, app.Log)
@@ -308,6 +310,10 @@ func main() {
 		conns.SetOnReload(func(context.Context) {
 			swapAgentTools(agent, builtinSet.snapshot(), conns, app.Log, toolCalls)
 		})
+		// The permission chain exempts a deferred index's load_tool by
+		// exact live name (D-108), so it reads the manager's set per
+		// call rather than guessing from a suffix.
+		chatPerms.SetLoadTools(conns.LoadToolNames)
 		go runConnectorReload(ctx, conns, app.Log)
 		app.AddCheck("connectors", func() httpserver.Check {
 			select {
@@ -885,6 +891,31 @@ func buildSecretStore(db *pgpool.Pool, log *slog.Logger) (*secretstore.Store, er
 		return nil, fmt.Errorf("secret store init failed: %w", err)
 	}
 	return secrets, nil
+}
+
+// runSecretResealSweep upgrades every db-backed secret still in the
+// pre-D-105 format once at boot (D-114). The read path already reseals,
+// but only when something reads, so a rarely-resolved secret keeps its
+// nil-AAD ciphertext, which opens under any ref_name and is therefore
+// the copyable one. Its own goroutine behind WaitHealthy, same as the
+// kb stale-ingest sweep: at this point in boot the pool is still
+// connecting. Failures log and are left to the next start; nothing here
+// blocks serving.
+func runSecretResealSweep(ctx context.Context, db *pgpool.Pool, secrets *secretstore.Store, log *slog.Logger) {
+	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := db.WaitHealthy(wctx); err != nil {
+		log.Warn("secret reseal sweep skipped: database not ready", "error", err)
+		return
+	}
+	n, err := secrets.ResealLegacy(wctx, log)
+	if err != nil {
+		log.Warn("secret reseal sweep failed", "error", err)
+		return
+	}
+	if n > 0 {
+		log.Info("secret reseal sweep", "secrets_resealed", n)
+	}
 }
 
 // buildAttachments wires the image-attachment store (D-045).
@@ -1603,7 +1634,31 @@ func adminProxy(gatewayURL string, usageDecorate func(*http.Response) error, log
 	return &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
+			// D-116: the usage sub-tree is the one pattern with a
+			// wildcard, so its tail comes from the matched {rest...}
+			// PathValue rather than a trim of the raw inbound path.
+			// ServeMux percent-DECODES the wildcard, so "..%2f" arrives
+			// here as a literal "..". Joining the tail onto the prefix
+			// directly would resolve those segments upward and out of it:
+			// path.Join normalizes, it does not confine. Anchoring the
+			// tail at "/" first is what confines it, since ".." can never
+			// climb above the root, so whatever remains joins inside the
+			// usage sub-tree. Every other admin pattern is literal (or
+			// {id}-shaped) and matched exactly by the mux, so its
+			// rewritten path is fixed by the pattern, not by anything the
+			// caller sends.
+			//
+			// RawPath is cleared alongside Path on both branches: it
+			// still holds the inbound encoding, and URL.EscapedPath
+			// prefers it over Path whenever the two agree, so leaving it
+			// set would send the original untouched upstream.
+			if rest := r.In.PathValue("rest"); rest != "" {
+				r.Out.URL.Path = path.Join("/internal/admin/usage", path.Join("/", rest))
+				r.Out.URL.RawPath = ""
+				return
+			}
 			r.Out.URL.Path = "/internal/admin/" + strings.TrimPrefix(r.In.URL.Path, "/v1/admin/")
+			r.Out.URL.RawPath = ""
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			// resp.Request is the OUTBOUND request: Rewrite above has
