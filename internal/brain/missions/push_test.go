@@ -243,7 +243,7 @@ func TestParseBitbucketRepoURL(t *testing.T) {
 		slug      string
 		wantOK    bool
 	}{
-		{"with .git suffix", "https://bitbucket.org/digital-platforms/bl-balance-ms.git", "digital-platforms", "bl-balance-ms", true},
+		{"with .git suffix", "https://bitbucket.org/acme-team/widget-service.git", "acme-team", "widget-service", true},
 		{"without .git suffix", "https://bitbucket.org/ws/repo", "ws", "repo", true},
 		{"trailing slash", "https://bitbucket.org/ws/repo/", "ws", "repo", true},
 		{"github host is rejected", "https://github.com/octocat/hello-world.git", "", "", false},

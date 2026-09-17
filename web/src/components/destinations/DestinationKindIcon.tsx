@@ -15,10 +15,10 @@ export function DestinationKindIcon({
   className?: string
 }) {
   if (kind === 'telegram') return <TelegramIcon className={className} />
-  if (kind === 'github') {
+  if (kind === 'github' || kind === 'bitbucket') {
     return (
       <svg className={`${className} fill-current`} aria-hidden="true">
-        <use href="#clogo-github" />
+        <use href={`#clogo-${kind}`} />
       </svg>
     )
   }
