@@ -45,3 +45,9 @@ ALTER TABLE connectors ADD CONSTRAINT connectors_kind_check CHECK (kind IN ('mcp
 ALTER TABLE connectors DROP CONSTRAINT IF EXISTS connectors_kind_check;
 ALTER TABLE connectors ADD CONSTRAINT connectors_kind_check CHECK (kind IN ('mcp','google','github','microsoft','imap','caldav','aws','gcp','bitbucket'));
 ```
+
+```sql
+-- issue #656: bitbucket destination kind (push / push+PR through a bitbucket connector).
+ALTER TABLE destinations DROP CONSTRAINT IF EXISTS destinations_kind_check;
+ALTER TABLE destinations ADD CONSTRAINT destinations_kind_check CHECK (kind IN ('email','webhook','telegram','github','bitbucket'));
+```

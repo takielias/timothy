@@ -115,7 +115,7 @@ func entries(ids ...string) []missions.DestinationEntry {
 func TestDeliverZeroDestinationsNoop(t *testing.T) {
 	destStore := &fakeDestStore{rows: map[string]Destination{}}
 	eventStore := &fakeEventStore{}
-	d := NewDeliverer(destStore, eventStore, nil, &WebhookAdapter{}, nil, nil, nil, nil, discardLog())
+	d := NewDeliverer(destStore, eventStore, nil, &WebhookAdapter{}, nil, nil, nil, nil, nil, discardLog())
 
 	if _, err := d.Deliver(t.Context(), missions.Mission{ID: "m1"}, nil); err != nil {
 		t.Fatalf("Deliver with zero destinations: %v", err)

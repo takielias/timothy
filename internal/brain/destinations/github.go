@@ -91,8 +91,14 @@ func NewGitHubAdapter(p pusher, e events, resolveToken PushTokenResolver, pr PRS
 // driver's auto-fire hook use, so the Timeline reads identically
 // regardless of which one fired.
 func (a *GitHubAdapter) PushBranch(ctx context.Context, m missions.Mission, token string) (host string, err error) {
+	return pushBranch(ctx, a.Pusher, a.Events, m, token)
+}
+
+// pushBranch is the push-and-record step both repo adapters share; the
+// credential username follows the mission's own source kind.
+func pushBranch(ctx context.Context, p pusher, ev events, m missions.Mission, token string) (host string, err error) {
 	src, _ := m.RepoSource()
-	host, pushErr := a.Pusher.Push(ctx, m.WorktreePath(), m.Branch, token, src.Source)
+	host, pushErr := p.Push(ctx, m.WorktreePath(), m.Branch, token, src.Source)
 	if pushErr != nil {
 		reason := "push failed"
 		switch {
@@ -101,12 +107,12 @@ func (a *GitHubAdapter) PushBranch(ctx context.Context, m missions.Mission, toke
 		case errors.Is(pushErr, missions.ErrPushRejected):
 			reason = "push rejected"
 		}
-		if err := a.Events.AppendEvent(ctx, m.ID, "mission.push_failed", map[string]any{"reason": reason}); err != nil {
+		if err := ev.AppendEvent(ctx, m.ID, "mission.push_failed", map[string]any{"reason": reason}); err != nil {
 			return "", fmt.Errorf("push: record push_failed: %w", err)
 		}
 		return "", pushErr
 	}
-	if err := a.Events.AppendEvent(ctx, m.ID, "mission.pushed", map[string]any{"branch": m.Branch, "remote_host": host}); err != nil {
+	if err := ev.AppendEvent(ctx, m.ID, "mission.pushed", map[string]any{"branch": m.Branch, "remote_host": host}); err != nil {
 		return host, fmt.Errorf("push: record pushed: %w", err)
 	}
 	return host, nil

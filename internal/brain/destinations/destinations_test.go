@@ -25,6 +25,8 @@ func TestValidate(t *testing.T) {
 		"gmail-ok":       {Kind: "google", Enabled: true},
 		"gmail-disabled": {Kind: "google", Enabled: false},
 		"mcp-conn":       {Kind: "mcp", Enabled: true},
+		"gh-ok":          {Kind: "github", Enabled: true},
+		"bb-ok":          {Kind: "bitbucket", Enabled: true},
 	}}
 
 	tests := []struct {
@@ -108,6 +110,31 @@ func TestValidate(t *testing.T) {
 		{
 			name:    "telegram missing credential_ref",
 			d:       Destination{Name: "tg", Kind: "telegram", Config: json.RawMessage(`{"chat_id":"123"}`)},
+			wantErr: true,
+		},
+		{
+			name:    "valid bitbucket",
+			d:       Destination{Name: "bb", Kind: "bitbucket", Config: json.RawMessage(`{"connector_id":"bb-ok","mode":"push_pr"}`)},
+			wantErr: false,
+		},
+		{
+			name:    "bitbucket with a github connector",
+			d:       Destination{Name: "bb", Kind: "bitbucket", Config: json.RawMessage(`{"connector_id":"gh-ok","mode":"push"}`)},
+			wantErr: true,
+		},
+		{
+			name:    "github with a bitbucket connector",
+			d:       Destination{Name: "gh", Kind: "github", Config: json.RawMessage(`{"connector_id":"bb-ok","mode":"push"}`)},
+			wantErr: true,
+		},
+		{
+			name:    "bitbucket bad mode",
+			d:       Destination{Name: "bb", Kind: "bitbucket", Config: json.RawMessage(`{"connector_id":"bb-ok","mode":"merge"}`)},
+			wantErr: true,
+		},
+		{
+			name:    "bitbucket must not set credential_ref",
+			d:       Destination{Name: "bb", Kind: "bitbucket", CredentialRef: "X", Config: json.RawMessage(`{"connector_id":"bb-ok","mode":"push"}`)},
 			wantErr: true,
 		},
 		{
