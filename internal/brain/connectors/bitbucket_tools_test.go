@@ -33,7 +33,7 @@ func TestSplitBitbucketRepoArg(t *testing.T) {
 		in, workspace, slug string
 		wantErr             bool
 	}{
-		{in: "digital-platforms/bl-balance-ms", workspace: "digital-platforms", slug: "bl-balance-ms"},
+		{in: "acme-team/widget-service", workspace: "acme-team", slug: "widget-service"},
 		{in: " ws/repo.1 ", workspace: "ws", slug: "repo.1"},
 		{in: "ws", wantErr: true},
 		{in: "ws/a/b", wantErr: true},
