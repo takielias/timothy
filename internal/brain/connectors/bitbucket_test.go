@@ -336,3 +336,186 @@ func TestFetchBitbucketReposStatusError(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// bitbucketSourceWith builds a bitbucket source whose resolver returns
+// the given token or error, for tests that exercise the Source methods
+// rather than the fetch helpers underneath them.
+func bitbucketSourceWith(t *testing.T, client *http.Client, token string, resolveErr error) *bitbucketSource {
+	t.Helper()
+	src, err := BitbucketBuilder(client)(t.Context(), Connector{Name: "bb", Kind: "bitbucket", CredentialRef: "BB_TOKEN"},
+		func(_ context.Context, _ string) (string, error) { return token, resolveErr })
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	return src.(*bitbucketSource)
+}
+
+// TestBitbucketSourceMethods covers Test, Identity and ListRepos through
+// the Source itself: the credential resolve happens there, so a
+// resolver failure must name the ref and never reach the network.
+func TestBitbucketSourceMethods(t *testing.T) {
+	var hits int
+	srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"username":"taki","display_name":"Taki"}`))
+		case "/user/emails":
+			_, _ = w.Write([]byte(`{"values":[]}`))
+		case "/repositories":
+			_ = json.NewEncoder(w).Encode(map[string]any{"values": []map[string]any{bitbucketRepoJSON("ws/one", "main")}})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	})
+
+	ok := bitbucketSourceWith(t, srv.Client(), "tok", nil)
+	if err := ok.Test(t.Context()); err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	id, err := ok.Identity(t.Context())
+	if err != nil || id.Login != "taki" {
+		t.Fatalf("Identity = %+v, %v", id, err)
+	}
+	repos, err := ok.ListRepos(t.Context())
+	if err != nil || len(repos) != 1 || repos[0].FullName != "ws/one" {
+		t.Fatalf("ListRepos = %+v, %v", repos, err)
+	}
+
+	hits = 0
+	broken := bitbucketSourceWith(t, srv.Client(), "", fmt.Errorf("vault sealed"))
+	for name, call := range map[string]func() error{
+		"Test":      func() error { return broken.Test(t.Context()) },
+		"Identity":  func() error { _, err := broken.Identity(t.Context()); return err },
+		"ListRepos": func() error { _, err := broken.ListRepos(t.Context()); return err },
+	} {
+		err := call()
+		if err == nil || !strings.Contains(err.Error(), `resolve credential_ref "BB_TOKEN": vault sealed`) {
+			t.Errorf("%s with failing resolver: err = %v", name, err)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("resolver failure still made %d requests", hits)
+	}
+}
+
+// TestBitbucketDecodeErrors pins that a 200 with an unparseable body
+// is reported as a decode failure naming the endpoint, not swallowed
+// as an empty result.
+func TestBitbucketDecodeErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		bad     string // path that returns garbage
+		call    func(client *http.Client) error
+		wantErr string
+	}{
+		{
+			name:    "/user",
+			bad:     "/user",
+			call:    func(c *http.Client) error { _, err := fetchBitbucketIdentity(t.Context(), c, "tok"); return err },
+			wantErr: "decode /user:",
+		},
+		{
+			name:    "/user/emails",
+			bad:     "/user/emails",
+			call:    func(c *http.Client) error { _, err := fetchBitbucketIdentity(t.Context(), c, "tok"); return err },
+			wantErr: "decode /user/emails:",
+		},
+		{
+			name:    "/repositories",
+			bad:     "/repositories",
+			call:    func(c *http.Client) error { _, err := fetchBitbucketRepos(t.Context(), c, "tok"); return err },
+			wantErr: "list repos:",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == tc.bad {
+					_, _ = w.Write([]byte(`{not json`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"username":"taki","values":[]}`))
+			})
+			err := tc.call(srv.Client())
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestBitbucketRequestErrors covers the two ways a request fails
+// before any status code exists: an unbuildable URL and a connection
+// refused. Neither may include the token.
+func TestBitbucketRequestErrors(t *testing.T) {
+	t.Run("unbuildable URL", func(t *testing.T) {
+		prev := bitbucketAPIBase
+		bitbucketAPIBase = "http://[::1]:namedport"
+		t.Cleanup(func() { bitbucketAPIBase = prev })
+		_, err := fetchBitbucketIdentity(t.Context(), &http.Client{}, "secret-token")
+		if err == nil || strings.Contains(err.Error(), "secret-token") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("connection refused", func(t *testing.T) {
+		srv := bitbucketFakeServer(t, func(http.ResponseWriter, *http.Request) {})
+		srv.Close()
+		_, err := fetchBitbucketRepos(t.Context(), &http.Client{}, "secret-token")
+		if err == nil || strings.Contains(err.Error(), "secret-token") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestBitbucketStatusErrorTruncatesLongText(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	rec.WriteHeader(http.StatusBadGateway)
+	_, _ = rec.WriteString(strings.Repeat("x", 250))
+	err := bitbucketStatusError(rec.Result())
+	want := "bitbucket: status 502: " + strings.Repeat("x", 200)
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v (len %d)", err, len(err.Error()))
+	}
+}
+
+// TestBitbucketEmailRequestError covers the network failure on the
+// second identity call: /user succeeds, the connection dies on
+// /user/emails, and the error surfaces without the token.
+func TestBitbucketEmailRequestError(t *testing.T) {
+	srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			_, _ = w.Write([]byte(`{"username":"taki"}`))
+			return
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		_ = conn.Close()
+	})
+	_, err := fetchBitbucketIdentity(t.Context(), srv.Client(), "secret-token")
+	if err == nil || strings.Contains(err.Error(), "secret-token") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestFetchBitbucketReposTrimsOversizedLastPage: a page larger than
+// requested (Bitbucket is free to ignore pagelen) can push the total
+// past the cap in one step; the result is trimmed, never over.
+func TestFetchBitbucketReposTrimsOversizedLastPage(t *testing.T) {
+	big := make([]map[string]any, 2*bitbucketRepoPageLen)
+	for i := range big {
+		big[i] = bitbucketRepoJSON(fmt.Sprintf("ws/r%d", i), "main")
+	}
+	srv := bitbucketFakeServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"values": big, "next": bitbucketAPIBase + "/repositories?page=more"})
+	})
+	repos, err := fetchBitbucketRepos(t.Context(), srv.Client(), "tok")
+	if err != nil {
+		t.Fatalf("fetchBitbucketRepos: %v", err)
+	}
+	if len(repos) != bitbucketRepoMaxRepos {
+		t.Fatalf("len(repos) = %d, want exactly %d", len(repos), bitbucketRepoMaxRepos)
+	}
+}

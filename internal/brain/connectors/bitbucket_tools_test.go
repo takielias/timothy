@@ -3,6 +3,7 @@ package connectors
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -411,5 +412,97 @@ func TestBitbucketPRToolsReachMissions(t *testing.T) {
 		if !got[name] {
 			t.Errorf("ReadOnlyTools lacks %s: got %v", name, got)
 		}
+	}
+}
+
+// TestBitbucketPRToolsResolveFailure pins that every tool surfaces a
+// credential resolve failure by ref name and makes no request.
+func TestBitbucketPRToolsResolveFailure(t *testing.T) {
+	var hits int
+	srv := bitbucketFakeServer(t, func(http.ResponseWriter, *http.Request) { hits++ })
+	src := bitbucketSourceWith(t, srv.Client(), "", fmt.Errorf("vault sealed"))
+	for _, tl := range src.Tools() {
+		_, err := tl.Execute(t.Context(), json.RawMessage(`{"repo":"ws/repo","number":7}`))
+		if err == nil || !strings.Contains(err.Error(), `resolve credential_ref "BB_TOKEN": vault sealed`) {
+			t.Errorf("%s: err = %v", tl.Name, err)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("resolver failure still made %d requests", hits)
+	}
+}
+
+// TestBitbucketPRArgsRepoShape covers the shared {repo, number} decoder's
+// repo validation, which the per-tool tables reach only for the list tool.
+func TestBitbucketPRArgsRepoShape(t *testing.T) {
+	t.Parallel()
+	for _, args := range []string{`{"repo":"nope","number":7}`, `{"repo":"a/b/c","number":7}`} {
+		if _, _, _, err := bitbucketPRArgs(json.RawMessage(args)); err == nil || !strings.Contains(err.Error(), `repo must be "workspace/slug"`) {
+			t.Errorf("%s: err = %v", args, err)
+		}
+	}
+}
+
+func TestBitbucketGetPullRequestDiffRequestErrors(t *testing.T) {
+	t.Run("connection refused", func(t *testing.T) {
+		srv := bitbucketFakeServer(t, func(http.ResponseWriter, *http.Request) {})
+		srv.Close()
+		tl := bitbucketSourceWith(t, &http.Client{}, "secret-token", nil).getPullRequestDiff()
+		_, err := tl.Execute(t.Context(), json.RawMessage(`{"repo":"ws/repo","number":7}`))
+		if err == nil || strings.Contains(err.Error(), "secret-token") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("body cut mid-read", func(t *testing.T) {
+		tl := bitbucketToolsSource(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", "100")
+			_, _ = w.Write([]byte("diff --git"))
+		})["get_pull_request_diff"]
+		_, err := tl.Execute(t.Context(), json.RawMessage(`{"repo":"ws/repo","number":7}`))
+		if err == nil || !strings.Contains(err.Error(), "get pull request diff: read response:") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestBitbucketGetJSONDecodeError(t *testing.T) {
+	tl := bitbucketToolsSource(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{not json`))
+	})["list_pull_requests"]
+	_, err := tl.Execute(t.Context(), json.RawMessage(`{"repo":"ws/repo"}`))
+	if err == nil || !strings.Contains(err.Error(), "list pull requests: decode response:") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestBitbucketCommentsInlineWithoutLine(t *testing.T) {
+	tl := bitbucketToolsSource(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"values":[{"id":1,"created_on":"a","content":{"raw":"whole file"},"user":{"nickname":"x"},"inline":{"path":"a.go","to":0,"from":null}}]}`))
+	})["list_pull_request_comments"]
+	got, err := tl.Execute(t.Context(), json.RawMessage(`{"repo":"ws/repo","number":7}`))
+	if err != nil || got != "[a] x (review on a.go):\nwhole file" {
+		t.Fatalf("got %q, err %v", got, err)
+	}
+}
+
+// TestBitbucketPRToolsRejectBadRepoArg reaches the shared decoder's
+// repo check through the two tools whose tables use fixed arguments.
+func TestBitbucketPRToolsRejectBadRepoArg(t *testing.T) {
+	tls := bitbucketToolsSource(t, func(_ http.ResponseWriter, r *http.Request) { t.Errorf("unexpected request %s", r.URL.Path) })
+	for _, name := range []string{"get_pull_request_diff", "list_pull_request_comments"} {
+		_, err := tls[name].Execute(t.Context(), json.RawMessage(`{"repo":"nope","number":7}`))
+		if err == nil || !strings.Contains(err.Error(), `repo must be "workspace/slug"`) {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+}
+
+func TestBitbucketGetJSONRequestError(t *testing.T) {
+	srv := bitbucketFakeServer(t, func(http.ResponseWriter, *http.Request) {})
+	srv.Close()
+	tl := bitbucketSourceWith(t, &http.Client{}, "secret-token", nil).listPullRequests()
+	_, err := tl.Execute(t.Context(), json.RawMessage(`{"repo":"ws/repo"}`))
+	if err == nil || strings.Contains(err.Error(), "secret-token") {
+		t.Fatalf("err = %v", err)
 	}
 }
