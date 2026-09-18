@@ -1556,7 +1556,11 @@ export function MissionForm({
                           onChange={(e) =>
                             setDestinationRepoURLs((prev) => ({ ...prev, [d.id]: e.target.value }))
                           }
-                          placeholder="https://github.com/owner/repo"
+                          placeholder={
+                            d.kind === 'bitbucket'
+                              ? 'https://bitbucket.org/workspace/repo'
+                              : 'https://github.com/owner/repo'
+                          }
                         />
                         <p className="text-xs text-muted-foreground">
                           Leave empty to push back to the source repository, or to create one when
@@ -1570,7 +1574,7 @@ export function MissionForm({
 
               {!githubDestinationKindOk && (
                 <p className="text-xs text-destructive">
-                  A GitHub destination only applies to a coding mission.
+                  A repository destination only applies to a coding mission.
                 </p>
               )}
 
