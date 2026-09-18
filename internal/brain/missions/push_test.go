@@ -413,6 +413,28 @@ func TestRawPushBitbucketKind(t *testing.T) {
 	}
 }
 
+// githubRepoPattern is host-agnostic on purpose, so the host gate is
+// its own check (issue #787).
+func TestIsGitHubHost(t *testing.T) {
+	for _, tc := range []struct {
+		url  string
+		want bool
+	}{
+		{url: "https://github.com/o/r.git", want: true},
+		{url: "https://GitHub.com/o/r", want: true},
+		{url: "https://bitbucket.org/acme/widgets.git", want: false},
+		{url: "https://ghe.example.com/o/r.git", want: false},
+		{url: "https://github.com.evil.test/o/r", want: false},
+		{url: "", want: false},
+	} {
+		t.Run(tc.url, func(t *testing.T) {
+			if got := isGitHubHost(tc.url); got != tc.want {
+				t.Fatalf("isGitHubHost(%q) = %v, want %v", tc.url, got, tc.want)
+			}
+		})
+	}
+}
+
 // The credential username follows the remote being pushed to, not the
 // mission's source: a scratch mission or a cross-kind destination makes
 // the two disagree (issue #787).
