@@ -56,9 +56,11 @@ func ParseGitHubRepoURL(repoURL string) (owner, repo string, ok bool) {
 
 // bitbucketRepoPattern pins the host, unlike githubRepoPattern: a
 // bitbucket connector paired with another host's URL is a misconfiguration.
-var bitbucketRepoPattern = regexp.MustCompile(`^https://bitbucket\.org/([^/]+)/([^/]+?)(?:\.git)?/?$`)
+// A browser URL (…/src/main/, …/pull-requests/) and the user@ form Bitbucket's
+// Clone button shows are accepted too; ssh is not, missions are https-only.
+var bitbucketRepoPattern = regexp.MustCompile(`^https://(?:[^@/]+@)?bitbucket\.org/([^/]+)/([^/]+?)(?:\.git)?(?:/(?:src|branch|pull-requests|commits)(?:/.*)?)?/?$`)
 
-// ParseBitbucketRepoURL extracts workspace/slug from a bitbucket.org https clone URL.
+// ParseBitbucketRepoURL extracts workspace/slug from a bitbucket.org https URL.
 func ParseBitbucketRepoURL(repoURL string) (workspace, slug string, ok bool) {
 	m := bitbucketRepoPattern.FindStringSubmatch(repoURL)
 	if m == nil {

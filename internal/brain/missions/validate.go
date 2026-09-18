@@ -141,8 +141,10 @@ func ValidateCreate(ctx context.Context, m Mission, deps ValidateDeps) error {
 		if e.DestinationID == "" || e.RepoURL == "" {
 			continue
 		}
-		if _, _, ok := ParseGitHubRepoURL(e.RepoURL); !ok {
-			return fmt.Errorf("%w: repo_url is not a recognizable https clone URL", ErrInvalidMission)
+		if _, _, gh := ParseGitHubRepoURL(e.RepoURL); !gh {
+			if _, _, bb := ParseBitbucketRepoURL(e.RepoURL); !bb {
+				return fmt.Errorf("%w: repo_url is not a recognizable https clone URL", ErrInvalidMission)
+			}
 		}
 	}
 	if deps.DestinationKind != nil {

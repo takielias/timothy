@@ -150,6 +150,13 @@ func TestValidateCreate(t *testing.T) {
 		{"bitbucket source on general is rejected like github", func(m Mission) Mission {
 			return withBitbucketSource(m, "https://bitbucket.org/ws/repo.git", "bb-1")
 		}, ValidateDeps{}, true},
+		{"browser url on a bitbucket destination is accepted", func(m Mission) Mission {
+			m.Kind = "coding"
+			m.Destinations = []DestinationEntry{{DestinationID: "bb-1", RepoURL: "https://bitbucket.org/ws/repo/src/main/"}}
+			return m
+		}, ValidateDeps{DestinationKind: func(ctx context.Context, id string) (string, bool, error) {
+			return "bitbucket", true, nil
+		}}, false},
 		{"repo_url on a bitbucket destination is accepted", func(m Mission) Mission {
 			m.Kind = "coding"
 			m.Destinations = []DestinationEntry{{DestinationID: "bb-1", RepoURL: "https://bitbucket.org/ws/repo"}}
