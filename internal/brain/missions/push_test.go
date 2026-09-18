@@ -266,6 +266,25 @@ func TestParseBitbucketRepoURL(t *testing.T) {
 	}
 }
 
+func TestBitbucketCloneURL(t *testing.T) {
+	t.Parallel()
+	want := "https://bitbucket.org/acme-team/widget-service.git"
+	for _, in := range []string{
+		"https://bitbucket.org/acme-team/widget-service.git",
+		"https://someone@bitbucket.org/acme-team/widget-service.git",
+		"https://bitbucket.org/acme-team/widget-service/src/master/",
+		"https://bitbucket.org/acme-team/widget-service",
+	} {
+		got, ok := BitbucketCloneURL(in)
+		if !ok || got != want {
+			t.Fatalf("BitbucketCloneURL(%q) = (%q, %v), want %q", in, got, ok, want)
+		}
+	}
+	if _, ok := BitbucketCloneURL("git@bitbucket.org:acme-team/widget-service.git"); ok {
+		t.Fatal("ssh form accepted")
+	}
+}
+
 func TestParseRepoURLForKind(t *testing.T) {
 	t.Parallel()
 	if _, _, ok := parseRepoURLForKind(SourceKindBitbucket, "https://github.com/o/r"); ok {

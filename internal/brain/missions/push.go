@@ -69,6 +69,17 @@ func ParseBitbucketRepoURL(repoURL string) (workspace, slug string, ok bool) {
 	return m[1], m[2], true
 }
 
+// BitbucketCloneURL turns any accepted bitbucket URL into the plain https
+// clone URL: the browser and user@ forms would otherwise be stored as-is
+// and fail validateRemote at push time.
+func BitbucketCloneURL(repoURL string) (string, bool) {
+	workspace, slug, ok := ParseBitbucketRepoURL(repoURL)
+	if !ok {
+		return "", false
+	}
+	return "https://bitbucket.org/" + workspace + "/" + slug + ".git", true
+}
+
 // parseRepoURLForKind picks the parser for a source or destination kind.
 func parseRepoURLForKind(kind, repoURL string) (owner, repo string, ok bool) {
 	if kind == SourceKindBitbucket {

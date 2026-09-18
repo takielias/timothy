@@ -811,7 +811,13 @@ func (h *missionAPI) create(w http.ResponseWriter, r *http.Request) {
 	sources = append(sources, refSources...)
 	sources = append(sources, pdfSources...)
 	if req.RepoURL != "" {
-		sources = append(sources, missions.SourceEntry{Source: sourceKind, ConnectorID: req.ConnectorID, RepoURL: req.RepoURL})
+		repoURL := req.RepoURL
+		if sourceKind == missions.SourceKindBitbucket {
+			if clone, ok := missions.BitbucketCloneURL(repoURL); ok {
+				repoURL = clone
+			}
+		}
+		sources = append(sources, missions.SourceEntry{Source: sourceKind, ConnectorID: req.ConnectorID, RepoURL: repoURL})
 	}
 	m := missions.Mission{
 		Goal: req.Goal, Kind: req.Kind, AgentID: req.AgentID,
