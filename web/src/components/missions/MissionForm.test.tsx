@@ -1125,6 +1125,16 @@ const githubConnector: AdminConnector = {
   sensitive: false,
 }
 
+const bitbucketConnector: AdminConnector = {
+  id: 'c2',
+  name: 'work-bb',
+  kind: 'bitbucket',
+  config: {},
+  credential_ref: 'BB_TOKEN',
+  enabled: true,
+  sensitive: false,
+}
+
 const repos: GitHubRepo[] = [
   {
     full_name: 'octocat/hello-world',
@@ -1181,12 +1191,48 @@ describe('MissionForm: repository source', () => {
     renderForm(<MissionForm mode="create" onDone={vi.fn()} onCancel={vi.fn()} />)
 
     await toCodingMission()
-    fireEvent.click(screen.getByRole('radio', { name: 'GitHub' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Repository' }))
 
-    expect(await screen.findByText(/No GitHub connectors configured yet/)).toBeInTheDocument()
+    expect(await screen.findByText(/No GitHub or Bitbucket connectors configured yet/)).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /Add one in Settings/ })).toHaveAttribute(
       'href',
       '/settings/connectors',
+    )
+  })
+
+  it('lists a bitbucket connector beside github and submits its repo', async () => {
+    vi.mocked(listConnectors).mockResolvedValue([githubConnector, bitbucketConnector])
+    vi.mocked(listConnectorRepos).mockResolvedValue([
+      {
+        full_name: 'acme-team/widget-service',
+        private: true,
+        default_branch: 'main',
+        html_url: 'https://bitbucket.org/acme-team/widget-service',
+        clone_url: 'https://bitbucket.org/acme-team/widget-service.git',
+        pushed_at: '2026-09-17T00:00:00Z',
+      },
+    ])
+    vi.mocked(createMission).mockResolvedValue({ id: 'm10' } as Mission)
+    renderForm(<MissionForm mode="create" onDone={vi.fn()} onCancel={vi.fn()} />)
+
+    await toCodingMission()
+    fireEvent.click(screen.getByRole('radio', { name: 'Repository' }))
+    fireEvent.click(await screen.findByLabelText('Connector'))
+    expect(await screen.findByText('personal-gh')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('work-bb'))
+
+    await waitFor(() => expect(listConnectorRepos).toHaveBeenCalledWith('c2'))
+    fireEvent.click(await screen.findByRole('button', { name: 'Choose a repository' }))
+    fireEvent.click(await screen.findByText('acme-team/widget-service'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create mission' }))
+    await waitFor(() =>
+      expect(createMission).toHaveBeenCalledWith(
+        expect.objectContaining({
+          repo_url: 'https://bitbucket.org/acme-team/widget-service.git',
+          connector_id: 'c2',
+        }),
+      ),
     )
   })
 
@@ -1197,7 +1243,7 @@ describe('MissionForm: repository source', () => {
     renderForm(<MissionForm mode="create" onDone={vi.fn()} onCancel={vi.fn()} />)
 
     await toCodingMission()
-    fireEvent.click(screen.getByRole('radio', { name: 'GitHub' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Repository' }))
     fireEvent.click(await screen.findByLabelText('Connector'))
     fireEvent.click(await screen.findByText('personal-gh'))
 
@@ -1229,7 +1275,7 @@ describe('MissionForm: repository source', () => {
     renderForm(<MissionForm mode="create" onDone={vi.fn()} onCancel={vi.fn()} />)
 
     await toCodingMission()
-    fireEvent.click(screen.getByRole('radio', { name: 'GitHub' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Repository' }))
     fireEvent.click(await screen.findByLabelText('Connector'))
     fireEvent.click(await screen.findByText('personal-gh'))
 
@@ -1243,7 +1289,7 @@ describe('MissionForm: repository source', () => {
     renderForm(<MissionForm mode="create" onDone={vi.fn()} onCancel={vi.fn()} />)
 
     await toCodingMission()
-    fireEvent.click(screen.getByRole('radio', { name: 'GitHub' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Repository' }))
 
     const submit = screen.getByRole('button', { name: 'Create mission' }) as HTMLButtonElement
     expect(submit.disabled).toBe(true)
@@ -1264,7 +1310,7 @@ describe('MissionForm: repository source', () => {
 // below build on.
 async function toCodingMissionWithRepo() {
   await toCodingMission()
-  fireEvent.click(screen.getByRole('radio', { name: 'GitHub' }))
+  fireEvent.click(screen.getByRole('radio', { name: 'Repository' }))
   fireEvent.click(await screen.findByLabelText('Connector'))
   fireEvent.click(await screen.findByText('personal-gh'))
   fireEvent.click(await screen.findByRole('button', { name: 'Choose a repository' }))
@@ -1974,7 +2020,7 @@ describe('MissionForm: goal repo proposal (issue #563)', () => {
     await toCodingMissionForProposal('Clone octocat/hello-world and audit its dependencies')
 
     expect(await screen.findByText('Proposed from the goal')).toBeInTheDocument()
-    expect(screen.getByRole('radio', { name: 'GitHub' })).toHaveAttribute('aria-checked', 'true')
+    expect(screen.getByRole('radio', { name: 'Repository' })).toHaveAttribute('aria-checked', 'true')
     expect(await screen.findByRole('button', { name: 'octocat/hello-world' })).toBeInTheDocument()
   })
 
@@ -2014,7 +2060,7 @@ describe('MissionForm: goal repo proposal (issue #563)', () => {
     renderForm(<MissionForm mode="create" onDone={vi.fn()} onCancel={vi.fn()} />)
 
     await toCodingMission()
-    fireEvent.click(screen.getByRole('radio', { name: 'GitHub' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Repository' }))
     fireEvent.click(await screen.findByLabelText('Connector'))
     fireEvent.click(await screen.findByText('personal-gh'))
     fireEvent.click(await screen.findByRole('button', { name: 'Choose a repository' }))
@@ -2046,7 +2092,7 @@ describe('MissionForm: goal repo proposal (issue #563)', () => {
     expect(screen.getByRole('radio', { name: 'None' })).toHaveAttribute('aria-checked', 'true')
 
     fireEvent.click(screen.getByRole('button', { name: 'octocat/widget-two' }))
-    expect(screen.getByRole('radio', { name: 'GitHub' })).toHaveAttribute('aria-checked', 'true')
+    expect(screen.getByRole('radio', { name: 'Repository' })).toHaveAttribute('aria-checked', 'true')
     expect(await screen.findByText('octocat/widget-two')).toBeInTheDocument()
   })
 

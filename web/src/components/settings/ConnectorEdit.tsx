@@ -61,6 +61,7 @@ interface StagedConnector {
   aws_region: string
   gcp_project_id: string
   gcp_location: string
+  bitbucket_workspace: string
 }
 
 function baselineFrom(connector: AdminConnector): StagedConnector {
@@ -72,6 +73,7 @@ function baselineFrom(connector: AdminConnector): StagedConnector {
     aws_region: String(connector.config.region ?? ''),
     gcp_project_id: String(connector.config.project_id ?? ''),
     gcp_location: String(connector.config.location ?? ''),
+    bitbucket_workspace: String(connector.config.workspace ?? ''),
   }
 }
 
@@ -97,6 +99,10 @@ function buildPatch(connector: AdminConnector, staged: StagedConnector): Partial
       if (value.trim()) config[key] = value.trim()
       else delete config[key]
     }
+  }
+  if (connector.kind === 'bitbucket') {
+    if (staged.bitbucket_workspace.trim()) config.workspace = staged.bitbucket_workspace.trim()
+    else delete config.workspace
   }
   return { name: slugify(staged.name), sensitive: staged.sensitive, config }
 }
@@ -372,6 +378,19 @@ function ConnectorEditForm({
             </>
           )}
 
+          {connector.kind === 'bitbucket' && (
+            <Field
+              label="Workspace"
+              description="required for a workspace or repository access token; a personal API token can leave it blank"
+              required={false}
+            >
+              <Input
+                value={staged.values.bitbucket_workspace}
+                onChange={(e) => staged.setField('bitbucket_workspace', e.target.value)}
+                placeholder="acme-team"
+              />
+            </Field>
+          )}
           {isGCP && (
             <>
               <Field

@@ -593,6 +593,31 @@ describe('ConnectorEdit rotate token and copy key', () => {
     expect(patchConnector).not.toHaveBeenCalled()
   })
 
+  it("edits a bitbucket connector's workspace and drops the key when cleared", async () => {
+    const bitbucketConnector: AdminConnector = {
+      id: 'bb4',
+      name: 'work-bb',
+      kind: 'bitbucket',
+      config: { workspace: 'acme-team' },
+      credential_ref: 'WORK_BB_BITBUCKET_TOKEN',
+      enabled: true,
+      sensitive: false,
+    }
+    vi.mocked(listConnectors).mockResolvedValue([bitbucketConnector])
+    vi.mocked(patchConnector).mockResolvedValue()
+    renderTab(`/settings/connectors/${bitbucketConnector.id}`)
+
+    const field = await screen.findByPlaceholderText('acme-team')
+    expect(field).toHaveValue('acme-team')
+    fireEvent.change(field, { target: { value: '' } })
+    fireEvent.click(screen.getAllByRole('button', { name: 'Save' }).find((b) => b.getAttribute('type') === 'submit')!)
+
+    await waitFor(() => expect(patchConnector).toHaveBeenCalled())
+    const patch = vi.mocked(patchConnector).mock.calls[0][1] as { config?: Record<string, unknown> }
+    expect(patch.config).toBeDefined()
+    expect('workspace' in patch.config!).toBe(false)
+  })
+
   it('mints a _BITBUCKET_TOKEN credential_ref for a bitbucket connector that has none', async () => {
     const bitbucketConnector: AdminConnector = {
       id: 'bb2',

@@ -384,14 +384,14 @@ type missionResponse struct {
 func (h *missionAPI) decorateTopModels(ctx context.Context, rows []missions.Mission) []missionResponse {
 	out := make([]missionResponse, len(rows))
 	for i, m := range rows {
-		github, _ := m.GitHubSource()
+		repo, _ := m.RepoSource()
 		var atts []responseAttachment
 		for _, a := range m.Attachments() {
 			atts = append(atts, responseAttachment{ID: a.ID, Mime: a.Mime, Name: a.Name})
 		}
 		out[i] = missionResponse{
 			Mission: m, Light: m.Flow == missions.FlowLight, Worktree: m.WorktreePath(),
-			RepoURL: github.RepoURL, ConnectorID: github.ConnectorID, Attachments: atts,
+			RepoURL: repo.RepoURL, ConnectorID: repo.ConnectorID, Attachments: atts,
 		}
 	}
 	if h.topModels == nil || len(rows) == 0 {
@@ -658,6 +658,7 @@ func (h *missionAPI) create(w http.ResponseWriter, r *http.Request) {
 	// connector_id existence + kind check is a store lookup ValidateCreate
 	// can't perform (it takes no connectors dependency); repo_url's other
 	// shape rules (coding-only, requires connector_id) are ValidateCreate's.
+	sourceKind := missions.SourceKindGitHub
 	if req.RepoURL != "" {
 		if h.conns == nil {
 			jsonError(w, http.StatusBadRequest, "bad_request", "connectors are not enabled")
@@ -668,8 +669,12 @@ func (h *missionAPI) create(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, http.StatusBadRequest, "bad_request", "unknown connector_id")
 			return
 		}
-		if c.Kind != "github" {
-			jsonError(w, http.StatusBadRequest, "bad_request", "connector_id must name a github-kind connector")
+		switch c.Kind {
+		case "github":
+		case "bitbucket":
+			sourceKind = missions.SourceKindBitbucket
+		default:
+			jsonError(w, http.StatusBadRequest, "bad_request", "connector_id must name a github- or bitbucket-kind connector")
 			return
 		}
 	}
@@ -806,7 +811,13 @@ func (h *missionAPI) create(w http.ResponseWriter, r *http.Request) {
 	sources = append(sources, refSources...)
 	sources = append(sources, pdfSources...)
 	if req.RepoURL != "" {
-		sources = append(sources, missions.SourceEntry{Source: missions.SourceKindGitHub, ConnectorID: req.ConnectorID, RepoURL: req.RepoURL})
+		repoURL := req.RepoURL
+		if sourceKind == missions.SourceKindBitbucket {
+			if clone, ok := missions.BitbucketCloneURL(repoURL); ok {
+				repoURL = clone
+			}
+		}
+		sources = append(sources, missions.SourceEntry{Source: sourceKind, ConnectorID: req.ConnectorID, RepoURL: repoURL})
 	}
 	m := missions.Mission{
 		Goal: req.Goal, Kind: req.Kind, AgentID: req.AgentID,
@@ -2262,8 +2273,8 @@ func (h *missionAPI) resolvePushToken(ctx context.Context, m missions.Mission, c
 	if err != nil {
 		return "", &pushTokenError{http.StatusBadRequest, "bad_request", "unknown connector_id"}
 	}
-	if c.Kind != "github" {
-		return "", &pushTokenError{http.StatusBadRequest, "bad_request", "connector_id must name a github-kind connector"}
+	if c.Kind != "github" && c.Kind != "bitbucket" {
+		return "", &pushTokenError{http.StatusBadRequest, "bad_request", "connector_id must name a github- or bitbucket-kind connector"}
 	}
 	if !c.Enabled {
 		return "", &pushTokenError{http.StatusBadRequest, "bad_request", "connector is disabled"}
@@ -2442,7 +2453,14 @@ func (h *missionAPI) pr(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "bad_request", "connectors are not enabled")
 		return
 	}
-	if _, _, ok := missions.ParseGitHubRepoURL(repoURL); !ok {
+	src, _ := m.RepoSource()
+	isBitbucket := src.Source == missions.SourceKindBitbucket
+	if isBitbucket {
+		if _, _, ok := missions.ParseBitbucketRepoURL(repoURL); !ok {
+			jsonError(w, http.StatusBadRequest, "bad_request", "mission repo_url is not a recognizable bitbucket https clone URL")
+			return
+		}
+	} else if _, _, ok := missions.ParseGitHubRepoURL(repoURL); !ok {
 		jsonError(w, http.StatusBadRequest, "bad_request", "mission repo_url is not a recognizable github https clone URL")
 		return
 	}
@@ -2457,7 +2475,13 @@ func (h *missionAPI) pr(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadGateway, "push_failed", err.Error())
 		return
 	}
-	url, number, err := h.completer().OpenPR(r.Context(), m, token)
+	var url string
+	var number int
+	if isBitbucket {
+		url, number, err = destinations.NewBitbucketAdapter(h.workspace, h.store, nil, h.prSource()).OpenPR(r.Context(), m, token)
+	} else {
+		url, number, err = h.completer().OpenPR(r.Context(), m, token)
+	}
 	if err != nil {
 		if errors.Is(err, missions.ErrRemoteUnsupported) || errors.Is(err, missions.ErrPushRejected) {
 			status, code := pushStatusCode(err)

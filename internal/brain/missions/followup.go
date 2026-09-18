@@ -104,8 +104,8 @@ func (d *Driver) CreateFollowUp(ctx context.Context, parentID string, opts Follo
 	parentSource := SourceEntry{Source: SourceKindMission, ID: ParentLineageID, MissionID: parent.ID, Digest: OutcomeDigest(parent, events, parent.Phase, parent.FailureReason)}
 	var sources []SourceEntry
 	sources = append(sources, parentSource)
-	if github, ok := parent.GitHubSource(); ok {
-		sources = append(sources, github)
+	if repo, ok := parent.repoSource(); ok {
+		sources = append(sources, repo)
 	}
 	if !opts.Brief.IsZero() {
 		sources = append(sources, SourceEntry{Source: SourceKindBrief, Name: "Brief", Digest: opts.Brief.Render()})

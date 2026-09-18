@@ -149,23 +149,23 @@ func validate(ctx context.Context, conns connectorLookup, d Destination) error {
 		if d.CredentialRef == "" {
 			return fmt.Errorf("telegram destination requires credential_ref (bot token)")
 		}
-	case "github":
+	case "github", "bitbucket":
 		var cfg GitHubConfig
 		if err := json.Unmarshal(d.Config, &cfg); err != nil {
-			return fmt.Errorf("github config: %w", err)
+			return fmt.Errorf("%s config: %w", d.Kind, err)
 		}
 		if cfg.ConnectorID == "" {
-			return fmt.Errorf("github destination requires config.connector_id")
+			return fmt.Errorf("%s destination requires config.connector_id", d.Kind)
 		}
 		if conns == nil {
-			return fmt.Errorf("github destination requires connectors to be enabled")
+			return fmt.Errorf("%s destination requires connectors to be enabled", d.Kind)
 		}
 		c, err := conns.Get(ctx, cfg.ConnectorID)
 		if err != nil {
 			return fmt.Errorf("config.connector_id: %w", err)
 		}
-		if c.Kind != "github" {
-			return fmt.Errorf("config.connector_id must name a github-kind connector")
+		if c.Kind != d.Kind {
+			return fmt.Errorf("config.connector_id must name a %s-kind connector", d.Kind)
 		}
 		if !c.Enabled {
 			return fmt.Errorf("config.connector_id names a disabled connector")
@@ -173,7 +173,7 @@ func validate(ctx context.Context, conns connectorLookup, d Destination) error {
 		switch cfg.Mode {
 		case "push", "push_pr":
 		default:
-			return fmt.Errorf(`github destination requires config.mode to be "push" or "push_pr"`)
+			return fmt.Errorf(`%s destination requires config.mode to be "push" or "push_pr"`, d.Kind)
 		}
 		if cfg.BranchPattern != "" {
 			if err := missions.ValidateBranchPattern(cfg.BranchPattern); err != nil {
@@ -184,10 +184,10 @@ func validate(ctx context.Context, conns connectorLookup, d Destination) error {
 			return fmt.Errorf("config.commit_style: %w", err)
 		}
 		if d.CredentialRef != "" {
-			return fmt.Errorf("github destination must not set credential_ref (token comes from the connector)")
+			return fmt.Errorf("%s destination must not set credential_ref (token comes from the connector)", d.Kind)
 		}
 	default:
-		return fmt.Errorf("unsupported kind %q (only email, webhook, telegram, github in this release)", d.Kind)
+		return fmt.Errorf("unsupported kind %q (only email, webhook, telegram, github, bitbucket in this release)", d.Kind)
 	}
 	return nil
 }

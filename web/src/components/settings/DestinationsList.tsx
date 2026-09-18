@@ -146,7 +146,7 @@ function DestinationCard({
       ? String(destination.config.to ?? '')
       : destination.kind === 'telegram'
         ? `chat ${String(destination.config.chat_id ?? '')}`
-        : destination.kind === 'github'
+        : destination.kind === 'github' || destination.kind === 'bitbucket'
           ? githubSummary(destination, connectors)
           : String(destination.config.url ?? '')
 

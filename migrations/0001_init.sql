@@ -987,7 +987,7 @@ CREATE INDEX IF NOT EXISTS kb_chunks_document_idx ON kb_chunks (document_id);
 CREATE TABLE destinations (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name        text NOT NULL UNIQUE,
-    kind        text NOT NULL CHECK (kind IN ('email', 'webhook', 'telegram', 'github')),
+    kind        text NOT NULL CHECK (kind IN ('email', 'webhook', 'telegram', 'github', 'bitbucket')),
     config      jsonb NOT NULL DEFAULT '{}',
     credential_ref text NOT NULL DEFAULT '',
     enabled     boolean NOT NULL DEFAULT true,

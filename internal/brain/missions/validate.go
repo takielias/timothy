@@ -121,6 +121,11 @@ func ValidateCreate(ctx context.Context, m Mission, deps ValidateDeps) error {
 	case repoURL == "" && connectorID != "":
 		return fmt.Errorf("%w: connector_id is only valid alongside repo_url", ErrInvalidMission)
 	}
+	if e, ok := m.repoSource(); ok && e.Source == SourceKindBitbucket {
+		if _, _, ok := ParseBitbucketRepoURL(e.RepoURL); !ok {
+			return fmt.Errorf("%w: repo_url is not a recognizable bitbucket https clone URL", ErrInvalidMission)
+		}
+	}
 	if m.Route == "" {
 		return fmt.Errorf("%w: route is required", ErrInvalidMission)
 	}
@@ -136,8 +141,10 @@ func ValidateCreate(ctx context.Context, m Mission, deps ValidateDeps) error {
 		if e.DestinationID == "" || e.RepoURL == "" {
 			continue
 		}
-		if _, _, ok := ParseGitHubRepoURL(e.RepoURL); !ok {
-			return fmt.Errorf("%w: repo_url is not a recognizable github https clone URL", ErrInvalidMission)
+		if _, _, gh := ParseGitHubRepoURL(e.RepoURL); !gh {
+			if _, _, bb := ParseBitbucketRepoURL(e.RepoURL); !bb {
+				return fmt.Errorf("%w: repo_url is not a recognizable https clone URL", ErrInvalidMission)
+			}
 		}
 	}
 	if deps.DestinationKind != nil {
@@ -154,11 +161,17 @@ func ValidateCreate(ctx context.Context, m Mission, deps ValidateDeps) error {
 				invalid = append(invalid, e.DestinationID)
 				continue
 			}
-			if kind == "github" && !missionPolicyFor(m).canDelegate {
-				return fmt.Errorf("%w: a github destination is only valid for kind=coding missions", ErrInvalidMission)
+			repoKind := kind == "github" || kind == "bitbucket"
+			if repoKind && !missionPolicyFor(m).canDelegate {
+				return fmt.Errorf("%w: a %s destination is only valid for kind=coding missions", ErrInvalidMission, kind)
 			}
-			if kind != "github" && e.RepoURL != "" {
-				return fmt.Errorf("%w: repo_url is only valid for a github destination entry", ErrInvalidMission)
+			if !repoKind && e.RepoURL != "" {
+				return fmt.Errorf("%w: repo_url is only valid for a github or bitbucket destination entry", ErrInvalidMission)
+			}
+			if kind == "bitbucket" && e.RepoURL != "" {
+				if _, _, ok := ParseBitbucketRepoURL(e.RepoURL); !ok {
+					return fmt.Errorf("%w: repo_url is not a recognizable bitbucket https clone URL", ErrInvalidMission)
+				}
 			}
 		}
 		if len(invalid) > 0 {

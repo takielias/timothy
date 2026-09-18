@@ -54,6 +54,40 @@ func ParseGitHubRepoURL(repoURL string) (owner, repo string, ok bool) {
 	return m[1], m[2], true
 }
 
+// bitbucketRepoPattern pins the host, unlike githubRepoPattern: a
+// bitbucket connector paired with another host's URL is a misconfiguration.
+// A browser URL (…/src/main/, …/pull-requests/) and the user@ form Bitbucket's
+// Clone button shows are accepted too; ssh is not, missions are https-only.
+var bitbucketRepoPattern = regexp.MustCompile(`^https://(?:[^@/]+@)?bitbucket\.org/([^/]+)/([^/]+?)(?:\.git)?(?:/(?:src|branch|pull-requests|commits)(?:/.*)?)?/?$`)
+
+// ParseBitbucketRepoURL extracts workspace/slug from a bitbucket.org https URL.
+func ParseBitbucketRepoURL(repoURL string) (workspace, slug string, ok bool) {
+	m := bitbucketRepoPattern.FindStringSubmatch(repoURL)
+	if m == nil {
+		return "", "", false
+	}
+	return m[1], m[2], true
+}
+
+// BitbucketCloneURL turns any accepted bitbucket URL into the plain https
+// clone URL: the browser and user@ forms would otherwise be stored as-is
+// and fail validateRemote at push time.
+func BitbucketCloneURL(repoURL string) (string, bool) {
+	workspace, slug, ok := ParseBitbucketRepoURL(repoURL)
+	if !ok {
+		return "", false
+	}
+	return "https://bitbucket.org/" + workspace + "/" + slug + ".git", true
+}
+
+// parseRepoURLForKind picks the parser for a source or destination kind.
+func parseRepoURLForKind(kind, repoURL string) (owner, repo string, ok bool) {
+	if kind == SourceKindBitbucket {
+		return ParseBitbucketRepoURL(repoURL)
+	}
+	return ParseGitHubRepoURL(repoURL)
+}
+
 // PRTitleGoalCap bounds a fallback title built from the goal when the
 // mission has no generated display name yet.
 const PRTitleGoalCap = 72
@@ -114,6 +148,17 @@ const pushTimeout = 120 * time.Second
 // accept them; must be checked before handing raw to url.Parse.
 var scpLikePattern = regexp.MustCompile(`^[\w.-]+@[\w.-]+:`)
 
+// gitCredentialHelper is the ephemeral helper git runs for token auth: the
+// username is per host (GitHub x-access-token, Bitbucket Cloud x-token-auth)
+// and the token comes from envVar, never argv.
+func gitCredentialHelper(hostKind, envVar string) string {
+	user := "x-access-token"
+	if hostKind == SourceKindBitbucket {
+		user = "x-token-auth"
+	}
+	return `!f() { echo "username=` + user + `"; echo "password=$` + envVar + `"; }; f`
+}
+
 // validateRemote allows only plain https:// origins with no embedded
 // credentials — v1 deliberately has no ssh/scp support and no
 // force-push option.
@@ -138,7 +183,7 @@ func validateRemote(raw string) (host string, err error) {
 // Push validates the worktree's origin remote, then pushes branch to
 // it authenticating via token — never written to argv, DB, logs, or
 // events. Returns the remote's host for event/response use.
-func (w *Workspace) Push(ctx context.Context, worktree, branch, token string) (string, error) {
+func (w *Workspace) Push(ctx context.Context, worktree, branch, token, hostKind string) (string, error) {
 	out, err := runGit(ctx, worktree, "remote", "get-url", "origin")
 	if err != nil {
 		return "", fmt.Errorf("push: read origin: %w: %s", err, out)
@@ -148,7 +193,7 @@ func (w *Workspace) Push(ctx context.Context, worktree, branch, token string) (s
 	if err != nil {
 		return "", err
 	}
-	return host, rawPush(ctx, worktree, branch, token)
+	return host, rawPush(ctx, worktree, branch, token, hostKind)
 }
 
 // SetOrigin points worktree's origin remote at remoteURL, adding it if
@@ -181,10 +226,10 @@ func (w *Workspace) SetOrigin(ctx context.Context, worktree, remoteURL string) e
 // plumbing against a local bare repo (which validateRemote's
 // https-only gate would otherwise block) without touching a real
 // https origin.
-func rawPush(ctx context.Context, worktree, branch, token string) error {
+func rawPush(ctx context.Context, worktree, branch, token, hostKind string) error {
 	cctx, cancel := context.WithTimeout(ctx, pushTimeout)
 	defer cancel()
-	helper := `!f() { echo "username=x-access-token"; echo "password=$GIT_PUSH_TOKEN"; }; f`
+	helper := gitCredentialHelper(hostKind, "GIT_PUSH_TOKEN")
 	cmd := exec.CommandContext(cctx, "git", //nolint:gosec // worktree/branch are harness-controlled; token travels via env, never argv
 		"-c", "credential.helper=",
 		"-c", "credential.helper="+helper,

@@ -424,7 +424,8 @@ export function MissionForm({
 
   // Repository source: 'none' self-initializes an empty repo (the
   // existing coding-mission default); 'github' clones an existing repo
-  // through a github-kind connector.
+  // through a github- or bitbucket-kind connector (the value predates
+  // the second kind).
   const [repoSource, setRepoSource] = useState<RepoSource>(initial?.repo_url ? 'github' : 'none')
   const [githubConnectors, setGithubConnectors] = useState<AdminConnector[] | null>(null)
   const [connectorID, setConnectorID] = useState(initial?.connector_id ?? '')
@@ -487,7 +488,7 @@ export function MissionForm({
   useEffect(() => {
     if ((repoSource !== 'github' && kind !== 'coding') || githubConnectors !== null) return
     listConnectors()
-      .then((all) => setGithubConnectors(all.filter((c) => c.kind === 'github' && c.enabled)))
+      .then((all) => setGithubConnectors(all.filter((c) => (c.kind === 'github' || c.kind === 'bitbucket') && c.enabled)))
       .catch(() => setGithubConnectors([]))
   }, [repoSource, kind, githubConnectors])
 
@@ -855,7 +856,7 @@ export function MissionForm({
   // A checked github destination only makes sense on a coding mission
   // (issue #561): the server rejects that combination with 400.
   const checkedGithubDestinations = (destinations ?? []).filter(
-    (d) => destinationIDs.includes(d.id) && d.kind === 'github',
+    (d) => destinationIDs.includes(d.id) && (d.kind === 'github' || d.kind === 'bitbucket'),
   )
   const githubDestinationKindOk = kind === 'coding' || checkedGithubDestinations.length === 0
 
@@ -863,7 +864,7 @@ export function MissionForm({
   // proposed, exactly one enabled github destination exists and isn't
   // already checked, and the goal mentions pushing/opening a PR, hint
   // at adding it. Never checks it automatically.
-  const enabledGithubDestinations = (destinations ?? []).filter((d) => d.kind === 'github' && d.enabled)
+  const enabledGithubDestinations = (destinations ?? []).filter((d) => (d.kind === 'github' || d.kind === 'bitbucket') && d.enabled)
   const suggestedGithubDestination =
     (repoAttached || sourceProposed) &&
     enabledGithubDestinations.length === 1 &&
@@ -1131,7 +1132,7 @@ export function MissionForm({
             }}
             options={[
               { value: 'none', label: 'None' },
-              { value: 'github', label: 'GitHub' },
+              { value: 'github', label: 'Repository' },
             ]}
           />
 
@@ -1172,7 +1173,7 @@ export function MissionForm({
                 <p className="text-sm text-muted-foreground">Loading connectors…</p>
               ) : githubConnectors.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
-                  No GitHub connectors configured yet.{' '}
+                  No GitHub or Bitbucket connectors configured yet.{' '}
                   <Link to="/settings/connectors" className="underline underline-offset-2">
                     Add one in Settings → Connectors
                   </Link>
@@ -1544,7 +1545,7 @@ export function MissionForm({
                       <span className="text-xs text-muted-foreground uppercase">{d.kind}</span>
                     </label>
 
-                    {d.kind === 'github' && destinationIDs.includes(d.id) && (
+                    {(d.kind === 'github' || d.kind === 'bitbucket') && destinationIDs.includes(d.id) && (
                       <div className="mt-1.5 ml-6 space-y-1.5">
                         <Label htmlFor={`mission-destination-repo-${d.id}`}>Target repository</Label>
                         <Input
@@ -1555,7 +1556,11 @@ export function MissionForm({
                           onChange={(e) =>
                             setDestinationRepoURLs((prev) => ({ ...prev, [d.id]: e.target.value }))
                           }
-                          placeholder="https://github.com/owner/repo"
+                          placeholder={
+                            d.kind === 'bitbucket'
+                              ? 'https://bitbucket.org/workspace/repo'
+                              : 'https://github.com/owner/repo'
+                          }
                         />
                         <p className="text-xs text-muted-foreground">
                           Leave empty to push back to the source repository, or to create one when
@@ -1569,7 +1574,7 @@ export function MissionForm({
 
               {!githubDestinationKindOk && (
                 <p className="text-xs text-destructive">
-                  A GitHub destination only applies to a coding mission.
+                  A repository destination only applies to a coding mission.
                 </p>
               )}
 

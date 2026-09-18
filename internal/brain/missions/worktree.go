@@ -78,7 +78,7 @@ func NewWorkspace(root string, identity func(context.Context) (name, email strin
 // generated: the branch {slug} comes from it (issue #494), falling back
 // to the goal when empty; {type} always derives from the goal, whose
 // wording ("fix", "docs") carries the intent a six-word title drops.
-func (w *Workspace) Provision(ctx context.Context, missionID, goal, name, kind, repoURL, token string, connIdentity *GitIdentity, branchPattern, baseRef string) (workspace, worktree, branch, baseCommit, baseUsed string, err error) {
+func (w *Workspace) Provision(ctx context.Context, missionID, goal, name, kind, repoURL, token string, connIdentity *GitIdentity, branchPattern, baseRef, hostKind string) (workspace, worktree, branch, baseCommit, baseUsed string, err error) {
 	workspace = filepath.Join(w.root, kind, missionID)
 	if err := os.MkdirAll(workspace, 0o750); err != nil {
 		return "", "", "", "", "", fmt.Errorf("worktree: provision: mkdir %s: %w", workspace, err)
@@ -103,7 +103,7 @@ func (w *Workspace) Provision(ctx context.Context, missionID, goal, name, kind, 
 	worktree = filepath.Join(workspace, "wt")
 
 	if repoURL != "" {
-		used, err := w.cloneRepo(ctx, workspace, worktree, branch, repoURL, token, connIdentity, baseRef)
+		used, err := w.cloneRepo(ctx, workspace, worktree, branch, repoURL, token, connIdentity, baseRef, hostKind)
 		if err != nil {
 			return "", "", "", "", "", err
 		}
@@ -171,10 +171,10 @@ const signingKeyFileName = "signing_key"
 // reach it. Accepted for the single-operator posture, same class as
 // D-054's executor auth-state volume; revisited together with
 // agentguard provisioning (U5b).
-func (w *Workspace) cloneRepo(ctx context.Context, workspaceDir, dir, branch, repoURL, token string, connIdentity *GitIdentity, baseRef string) (baseUsed string, err error) {
+func (w *Workspace) cloneRepo(ctx context.Context, workspaceDir, dir, branch, repoURL, token string, connIdentity *GitIdentity, baseRef, hostKind string) (baseUsed string, err error) {
 	cctx, cancel := context.WithTimeout(ctx, cloneTimeout)
 	defer cancel()
-	helper := `!f() { echo "username=x-access-token"; echo "password=$GIT_CLONE_TOKEN"; }; f`
+	helper := gitCredentialHelper(hostKind, "GIT_CLONE_TOKEN")
 	cmd := exec.CommandContext(cctx, "git", //nolint:gosec // repoURL/dir are validated https origins/harness-controlled paths; token travels via env, never argv
 		"-c", "credential.helper=",
 		"-c", "credential.helper="+helper,

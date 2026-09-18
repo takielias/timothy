@@ -2,7 +2,7 @@
 // mirroring connectorPresets.ts's shape for the fixed set of
 // destination kinds.
 export interface DestinationPreset {
-  id: 'email' | 'webhook' | 'telegram' | 'github'
+  id: 'email' | 'webhook' | 'telegram' | 'github' | 'bitbucket'
   name: string
   description: string
 }
@@ -26,6 +26,11 @@ export const destinationPresets: DestinationPreset[] = [
   {
     id: 'github',
     name: 'GitHub',
+    description: 'Pushes a branch or opens a PR via a connector',
+  },
+  {
+    id: 'bitbucket',
+    name: 'Bitbucket',
     description: 'Pushes a branch or opens a PR via a connector',
   },
 ]

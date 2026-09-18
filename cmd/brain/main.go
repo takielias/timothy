@@ -375,6 +375,7 @@ func main() {
 	// the manual push/pr API endpoints use. nil workspace/store (missions
 	// disabled) still builds one; ResolveToken/PR nil-gate its actual use.
 	var githubAdapter *destinations.GitHubAdapter
+	var bitbucketAdapter *destinations.BitbucketAdapter
 	if missionDriver != nil {
 		var resolveGitHubToken destinations.PushTokenResolver
 		var githubPR destinations.PRSource
@@ -392,8 +393,10 @@ func main() {
 		githubAdapter.Attribution = func(ctx context.Context) bool {
 			return flags.Enabled(ctx, settings.KeyPRAttribution)
 		}
+		bitbucketAdapter = destinations.NewBitbucketAdapter(missionWorkspace, missionStore, resolveGitHubToken, githubPR)
+		bitbucketAdapter.Attribution = githubAdapter.Attribution
 	}
-	destinationStore, destinationDeliverer := buildDestinations(app.DB, conns, goog, secrets, flags, missionStore, githubAdapter, app.Log)
+	destinationStore, destinationDeliverer := buildDestinations(app.DB, conns, goog, secrets, flags, missionStore, githubAdapter, bitbucketAdapter, app.Log)
 	if missionDriver != nil && destinationDeliverer != nil {
 		missionDriver.SetDestinationDeliver(destinationDeliverer.Deliver)
 	}
@@ -980,7 +983,7 @@ func writingSettings(flags *settings.Store) func(context.Context) (string, strin
 // validation with a clear error, same nil-gated shape as
 // api/missions.go's own repo_url-needs-connectors check. secrets nil
 // (no valid master key) leaves telegram unregistered the same way.
-func buildDestinations(db *pgpool.Pool, conns *connectors.Manager, goog *connectors.Google, secrets *secretstore.Store, flags *settings.Store, missionStore *missions.Store, github *destinations.GitHubAdapter, log *slog.Logger) (*destinations.Store, *destinations.Deliverer) {
+func buildDestinations(db *pgpool.Pool, conns *connectors.Manager, goog *connectors.Google, secrets *secretstore.Store, flags *settings.Store, missionStore *missions.Store, github *destinations.GitHubAdapter, bitbucket *destinations.BitbucketAdapter, log *slog.Logger) (*destinations.Store, *destinations.Deliverer) {
 	if missionStore == nil {
 		return nil, nil
 	}
@@ -1003,7 +1006,7 @@ func buildDestinations(db *pgpool.Pool, conns *connectors.Manager, goog *connect
 	if secrets != nil {
 		telegram = &destinations.TelegramAdapter{ResolveToken: secrets.Resolve}
 	}
-	deliverer := destinations.NewDeliverer(store, missionStore, email, webhook, telegram, github, flags.WebBaseURL, flags.Location, log)
+	deliverer := destinations.NewDeliverer(store, missionStore, email, webhook, telegram, github, bitbucket, flags.WebBaseURL, flags.Location, log)
 	return store, deliverer
 }
 

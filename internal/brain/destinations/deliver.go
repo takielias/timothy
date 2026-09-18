@@ -44,10 +44,11 @@ type Deliverer struct {
 	// GitHubAdapter.DeliverMission (push/PR, no Payload rendering, no
 	// retry) rather than the Adapter interface, so deliverOne special-cases
 	// kind == "github" instead of a map lookup.
-	github   *GitHubAdapter
-	webURL   func(ctx context.Context) string
-	location func(ctx context.Context) *time.Location
-	log      *slog.Logger
+	github    *GitHubAdapter
+	bitbucket *BitbucketAdapter
+	webURL    func(ctx context.Context) string
+	location  func(ctx context.Context) *time.Location
+	log       *slog.Logger
 }
 
 // NewDeliverer builds a Deliverer. webURL resolves the web_base_url
@@ -60,15 +61,16 @@ type Deliverer struct {
 // first field access inside Deliver). location follows the same
 // fresh-read pattern as webURL; nil (or a nil *time.Location it
 // returns) defaults to UTC.
-func NewDeliverer(store destinationStore, events eventRecorder, email *EmailAdapter, webhook *WebhookAdapter, telegram *TelegramAdapter, github *GitHubAdapter, webURL func(ctx context.Context) string, location func(ctx context.Context) *time.Location, log *slog.Logger) *Deliverer {
+func NewDeliverer(store destinationStore, events eventRecorder, email *EmailAdapter, webhook *WebhookAdapter, telegram *TelegramAdapter, github *GitHubAdapter, bitbucket *BitbucketAdapter, webURL func(ctx context.Context) string, location func(ctx context.Context) *time.Location, log *slog.Logger) *Deliverer {
 	d := &Deliverer{
-		store:    store,
-		events:   events,
-		adapters: map[string]Adapter{"webhook": webhook},
-		github:   github,
-		webURL:   webURL,
-		location: location,
-		log:      log,
+		store:     store,
+		events:    events,
+		adapters:  map[string]Adapter{"webhook": webhook},
+		github:    github,
+		bitbucket: bitbucket,
+		webURL:    webURL,
+		location:  location,
+		log:       log,
 	}
 	if email != nil {
 		d.adapters["email"] = email
@@ -115,7 +117,7 @@ func (d *Deliverer) Deliver(ctx context.Context, m missions.Mission, entries []m
 	var githubIdx, otherIdx []int
 	for i, e := range entries {
 		dest, err := d.store.Get(ctx, e.DestinationID)
-		if err == nil && dest.Kind == "github" {
+		if err == nil && isRepoKind(dest.Kind) {
 			githubIdx = append(githubIdx, i)
 		} else {
 			otherIdx = append(otherIdx, i)
@@ -190,23 +192,29 @@ func (d *Deliverer) deliverOne(ctx context.Context, m missions.Mission, e *missi
 		return errors.New(reason)
 	}
 
-	if dest.Kind == "github" {
-		// github delivery is push/PR, not a rendered Payload send: a
+	if isRepoKind(dest.Kind) {
+		// repo delivery is push/PR, not a rendered Payload send: a
 		// single attempt, no deliverBackoff retries (a push retry against
 		// a half-pushed branch is a different risk profile than re-POSTing
 		// a webhook).
-		if d.github == nil {
-			reason := "no adapter for kind github"
-			d.recordOutcome(ctx, missionID, e, dest.Name, reason)
-			return errors.New(reason)
-		}
 		var cfg GitHubConfig
 		if err := json.Unmarshal(dest.Config, &cfg); err != nil {
-			reason := "github config: " + err.Error()
+			reason := dest.Kind + " config: " + err.Error()
 			d.recordOutcome(ctx, missionID, e, dest.Name, reason)
 			return errors.New(reason)
 		}
-		if err := d.github.DeliverMission(ctx, cfg, m, e); err != nil {
+		var err error
+		switch {
+		case dest.Kind == "github" && d.github != nil:
+			err = d.github.DeliverMission(ctx, cfg, m, e)
+		case dest.Kind == "bitbucket" && d.bitbucket != nil:
+			err = d.bitbucket.DeliverMission(ctx, cfg, m, e)
+		default:
+			reason := "no adapter for kind " + dest.Kind
+			d.recordOutcome(ctx, missionID, e, dest.Name, reason)
+			return errors.New(reason)
+		}
+		if err != nil {
 			d.recordOutcome(ctx, missionID, e, dest.Name, err.Error())
 			return err
 		}
@@ -289,8 +297,8 @@ func (d *Deliverer) Test(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if dest.Kind == "github" {
-		return fmt.Errorf("github destinations have no test send: use the mission's push/pr actions instead")
+	if isRepoKind(dest.Kind) {
+		return fmt.Errorf("%s destinations have no test send: use the mission's push/pr actions instead", dest.Kind)
 	}
 	adapter := d.adapters[dest.Kind]
 	if adapter == nil {
@@ -314,8 +322,8 @@ func (d *Deliverer) DeliverNow(ctx context.Context, id, subject, body string) (n
 	if !dest.Enabled {
 		return "", "", fmt.Errorf("destination %q is disabled", dest.Name)
 	}
-	if dest.Kind == "github" {
-		return "", "", fmt.Errorf("github destinations are not usable by the deliver tool")
+	if isRepoKind(dest.Kind) {
+		return "", "", fmt.Errorf("%s destinations are not usable by the deliver tool", dest.Kind)
 	}
 	adapter := d.adapters[dest.Kind]
 	if adapter == nil {
@@ -327,3 +335,7 @@ func (d *Deliverer) DeliverNow(ctx context.Context, id, subject, body string) (n
 	}
 	return dest.Name, dest.Kind, nil
 }
+
+// isRepoKind names the destination kinds that push a branch or open a
+// PR instead of sending a rendered payload.
+func isRepoKind(kind string) bool { return kind == "github" || kind == "bitbucket" }

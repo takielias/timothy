@@ -75,7 +75,7 @@ func TestRawPushScrubsTokenFromError(t *testing.T) {
 	root := t.TempDir()
 	missing := filepath.Join(root, "does-not-exist")
 	const token = "super-secret-token-value"
-	err := rawPush(context.Background(), missing, "main", token)
+	err := rawPush(context.Background(), missing, "main", token, "")
 	if err == nil {
 		t.Fatal("rawPush against a nonexistent directory should fail")
 	}
@@ -110,7 +110,7 @@ func TestRawPushHappyPath(t *testing.T) {
 	gitRun(t, workdir, "-c", "user.name=test", "-c", "user.email=test@test", "commit", "-q", "-m", "add file")
 	branch := strings.TrimSpace(gitRun(t, workdir, "rev-parse", "--abbrev-ref", "HEAD"))
 
-	if err := rawPush(context.Background(), workdir, branch, "dummy-token"); err != nil {
+	if err := rawPush(context.Background(), workdir, branch, "dummy-token", ""); err != nil {
 		t.Fatalf("rawPush: %v", err)
 	}
 
@@ -234,6 +234,70 @@ func TestParseGitHubRepoURL(t *testing.T) {
 	}
 }
 
+func TestParseBitbucketRepoURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		url       string
+		workspace string
+		slug      string
+		wantOK    bool
+	}{
+		{"with .git suffix", "https://bitbucket.org/acme-team/widget-service.git", "acme-team", "widget-service", true},
+		{"without .git suffix", "https://bitbucket.org/ws/repo", "ws", "repo", true},
+		{"trailing slash", "https://bitbucket.org/ws/repo/", "ws", "repo", true},
+		{"clone button form with a username", "https://someone@bitbucket.org/ws/repo.git", "ws", "repo", true},
+		{"browser url with a branch path", "https://bitbucket.org/ws/repo/src/master/", "ws", "repo", true},
+		{"browser url deep in the tree", "https://bitbucket.org/ws/repo/src/main/app/Http/", "ws", "repo", true},
+		{"pull request page", "https://bitbucket.org/ws/repo/pull-requests/12", "ws", "repo", true},
+		{"unknown page kind is rejected", "https://bitbucket.org/ws/repo/settings", "", "", false},
+		{"github host is rejected", "https://github.com/octocat/hello-world.git", "", "", false},
+		{"ssh form is rejected", "git@bitbucket.org:ws/repo.git", "", "", false},
+		{"no slug", "https://bitbucket.org/ws", "", "", false},
+		{"empty", "", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace, slug, ok := ParseBitbucketRepoURL(tc.url)
+			if ok != tc.wantOK || workspace != tc.workspace || slug != tc.slug {
+				t.Fatalf("ParseBitbucketRepoURL(%q) = (%q, %q, %v), want (%q, %q, %v)", tc.url, workspace, slug, ok, tc.workspace, tc.slug, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestBitbucketCloneURL(t *testing.T) {
+	t.Parallel()
+	want := "https://bitbucket.org/acme-team/widget-service.git"
+	for _, in := range []string{
+		"https://bitbucket.org/acme-team/widget-service.git",
+		"https://someone@bitbucket.org/acme-team/widget-service.git",
+		"https://bitbucket.org/acme-team/widget-service/src/master/",
+		"https://bitbucket.org/acme-team/widget-service",
+	} {
+		got, ok := BitbucketCloneURL(in)
+		if !ok || got != want {
+			t.Fatalf("BitbucketCloneURL(%q) = (%q, %v), want %q", in, got, ok, want)
+		}
+	}
+	if _, ok := BitbucketCloneURL("git@bitbucket.org:acme-team/widget-service.git"); ok {
+		t.Fatal("ssh form accepted")
+	}
+}
+
+func TestParseRepoURLForKind(t *testing.T) {
+	t.Parallel()
+	if _, _, ok := parseRepoURLForKind(SourceKindBitbucket, "https://github.com/o/r"); ok {
+		t.Fatal("bitbucket kind accepted a github URL")
+	}
+	if o, r, ok := parseRepoURLForKind(SourceKindGitHub, "https://github.com/o/r"); !ok || o != "o" || r != "r" {
+		t.Fatalf("github kind: (%q, %q, %v)", o, r, ok)
+	}
+	if w, s, ok := parseRepoURLForKind(SourceKindBitbucket, "https://bitbucket.org/w/s.git"); !ok || w != "w" || s != "s" {
+		t.Fatalf("bitbucket kind: (%q, %q, %v)", w, s, ok)
+	}
+}
+
 // TestConventionalPRTitle covers the Conventional Commits shape the
 // github destination uses for PR titles (issue #709).
 func TestConventionalPRTitle(t *testing.T) {
@@ -278,5 +342,69 @@ func TestPRTitleFallsBackToTruncatedGoal(t *testing.T) {
 	got := PRTitle(long)
 	if len(got) != PRTitleGoalCap+len("…") || !strings.HasSuffix(got, "…") {
 		t.Fatalf("PRTitle with a long goal and no name = %q (len %d), want truncated to %d chars + ellipsis", got, len(got), PRTitleGoalCap)
+	}
+}
+
+// The helper is a shell snippet git runs; execute it through a real /bin/sh
+// and read what it prints, per host kind. The token must only ever come from
+// the environment.
+func TestGitCredentialHelperRoundTrip(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ kind, wantUser string }{
+		{"", "x-access-token"},
+		{SourceKindGitHub, "x-access-token"},
+		{SourceKindBitbucket, "x-token-auth"},
+	} {
+		t.Run("kind="+tc.kind, func(t *testing.T) {
+			t.Parallel()
+			helper := gitCredentialHelper(tc.kind, "GIT_TEST_TOKEN")
+			if strings.Contains(helper, "tok-value") {
+				t.Fatalf("token leaked into the helper string: %s", helper)
+			}
+			// git strips the leading "!" before handing the rest to the shell
+			cmd := exec.Command("/bin/sh", "-c", strings.TrimPrefix(helper, "!")) //nolint:gosec // the composed helper is the thing under test
+			cmd.Env = append(os.Environ(), "GIT_TEST_TOKEN=tok-value")
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("sh: %v: %s", err, out)
+			}
+			want := "username=" + tc.wantUser + "\npassword=tok-value\n"
+			if string(out) != want {
+				t.Fatalf("helper printed %q, want %q", out, want)
+			}
+		})
+	}
+}
+
+// A bitbucket push against a local bare remote must succeed with the
+// x-token-auth helper in place: the remote ignores credentials, so this
+// proves the composed command still runs end to end for the second kind.
+func TestRawPushBitbucketKind(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	bare := t.TempDir()
+	if out, err := exec.Command("git", "init", "--bare", "-q", bare).CombinedOutput(); err != nil { //nolint:gosec // test-only temp dir
+		t.Fatalf("init bare: %v: %s", err, out)
+	}
+	wt := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "t@example.com"},
+		{"config", "user.name", "t"},
+		{"remote", "add", "origin", bare},
+		{"commit", "--allow-empty", "-q", "-m", "init"},
+		{"checkout", "-q", "-b", "feat/x"},
+		{"commit", "--allow-empty", "-q", "-m", "work"},
+	} {
+		if out, err := runGit(ctx, wt, args...); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	if err := rawPush(ctx, wt, "feat/x", "unused-token", SourceKindBitbucket); err != nil {
+		t.Fatalf("rawPush: %v", err)
+	}
+	out, err := exec.Command("git", "-C", bare, "branch", "--list", "feat/x").CombinedOutput() //nolint:gosec // test-only temp dir
+	if err != nil || !strings.Contains(string(out), "feat/x") {
+		t.Fatalf("branch not on remote: %v: %s", err, out)
 	}
 }

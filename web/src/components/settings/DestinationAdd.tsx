@@ -24,7 +24,8 @@ const area = settingsArea('destinations')
 // it. GitHub has no test-send affordance, so it creates enabled
 // directly.
 export function DestinationAdd() {
-  const { kind } = useParams<{ kind: 'email' | 'webhook' | 'telegram' | 'github' }>()
+  const { kind } = useParams<{ kind: 'email' | 'webhook' | 'telegram' | 'github' | 'bitbucket' }>()
+  const isRepoKind = kind === 'github' || kind === 'bitbucket'
   const navigate = useNavigate()
   const defaultBackend = useDefaultSecretBackend()
 
@@ -56,14 +57,14 @@ export function DestinationAdd() {
   const [existingBotTokenRef, setExistingBotTokenRef] = useState('')
 
   useEffect(() => {
-    if (kind !== 'email' && kind !== 'github') return
-    const wantKind = kind === 'email' ? 'google' : 'github'
+    if (kind !== 'email' && kind !== 'github' && kind !== 'bitbucket') return
+    const wantKind = kind === 'email' ? 'google' : kind
     listConnectors()
       .then((rows) => setConnectors(rows.filter((c) => c.kind === wantKind && c.enabled)))
       .catch((err: unknown) => toast.error('Could not load connectors', { description: errText(err) }))
   }, [kind])
 
-  if (kind !== 'email' && kind !== 'webhook' && kind !== 'telegram' && kind !== 'github') {
+  if (kind !== 'email' && kind !== 'webhook' && kind !== 'telegram' && !isRepoKind) {
     return <Navigate to="/settings/destinations" replace />
   }
 
@@ -81,7 +82,7 @@ export function DestinationAdd() {
       ? { connector_id: values.connectorID, to: values.to.trim() }
       : kind === 'telegram'
         ? { chat_id: values.chatID.trim() }
-        : kind === 'github'
+        : isRepoKind
           ? {
               connector_id: values.connectorID,
               mode: values.mode,
@@ -97,7 +98,7 @@ export function DestinationAdd() {
       ? values.connectorID !== '' && values.to.trim() !== ''
       : kind === 'telegram'
         ? values.chatID.trim() !== '' && (usingExistingBotToken ? existingBotTokenRef !== '' : botToken.trim() !== '')
-        : kind === 'github'
+        : isRepoKind
           ? values.connectorID !== ''
           : values.url.trim() !== '')
 
@@ -128,7 +129,7 @@ export function DestinationAdd() {
     if (!canTest) return
     setBusy(true)
     try {
-      await createDestination({ name: slug, kind: 'github', config, enabled: true })
+      await createDestination({ name: slug, kind, config, enabled: true })
       toast.success('Destination added')
       navigate('/settings/destinations')
     } catch (err) {
@@ -164,7 +165,7 @@ export function DestinationAdd() {
         ? 'failed'
         : 'gate'
 
-  const destinationTitle = `Add ${kind === 'email' ? 'Email' : kind === 'telegram' ? 'Telegram' : kind === 'github' ? 'GitHub' : 'Webhook'} destination`
+  const destinationTitle = `Add ${kind === 'email' ? 'Email' : kind === 'telegram' ? 'Telegram' : kind === 'github' ? 'GitHub' : kind === 'bitbucket' ? 'Bitbucket' : 'Webhook'} destination`
 
   return (
     <PageShell width="form">
@@ -197,9 +198,9 @@ export function DestinationAdd() {
               No enabled Google connectors yet - add one under Connectors first.
             </p>
           )}
-          {kind === 'github' && connectors && connectors.length === 0 && (
+          {isRepoKind && connectors && connectors.length === 0 && (
             <p className="-mt-2 text-sm text-muted-foreground">
-              No enabled GitHub connectors yet, add one under Connectors first.
+              No enabled {kind === 'github' ? 'GitHub' : 'Bitbucket'} connectors yet, add one under Connectors first.
             </p>
           )}
 
@@ -228,7 +229,7 @@ export function DestinationAdd() {
           )}
         </FieldGroup>
 
-        {kind !== 'github' &&
+        {!isRepoKind &&
           (testState === 'gate' ? (
             <div className="flex flex-wrap items-center gap-3 rounded-md border border-border bg-muted/40 p-4 text-sm text-muted-foreground">
               <span className="min-w-0 flex-1 font-medium">Not tested yet, run a test before adding.</span>
@@ -260,7 +261,7 @@ export function DestinationAdd() {
           <Button type="button" variant="outline" disabled={busy} onClick={() => navigate('/settings/destinations')}>
             Cancel
           </Button>
-          {kind === 'github' ? (
+          {isRepoKind ? (
             <Button disabled={!canTest || busy} onClick={() => void submitGitHub()}>
               {busy ? 'Adding…' : 'Add destination'}
             </Button>

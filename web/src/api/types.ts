@@ -967,7 +967,7 @@ interface DestinationEntry {
 export interface Destination {
   id: string
   name: string
-  kind: 'email' | 'webhook' | 'telegram' | 'github'
+  kind: 'email' | 'webhook' | 'telegram' | 'github' | 'bitbucket'
   config: Record<string, unknown>
   credential_ref: string
   enabled: boolean
