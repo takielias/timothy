@@ -68,7 +68,9 @@ func (a *BitbucketAdapter) openPRFor(ctx context.Context, m missions.Mission, to
 }
 
 // ensureRepo resolves the push target, creating the repo when it does
-// not exist and createIfMissing is set. Same cases as the github one.
+// not exist and createIfMissing is set. Same cases as the github one, plus:
+// an existing target always becomes the worktree's origin, so a scratch
+// mission (never cloned, no remote) can still push to a repo that exists.
 func (a *BitbucketAdapter) ensureRepo(ctx context.Context, m missions.Mission, connectorID, repoURL string, createIfMissing bool) (string, bool, error) {
 	if repoURL == "" && !createIfMissing {
 		return repoURL, false, nil
@@ -90,7 +92,11 @@ func (a *BitbucketAdapter) ensureRepo(ctx context.Context, m missions.Mission, c
 			return repoURL, false, fmt.Errorf("ensure repo: check existence: %w", err)
 		}
 		if exists {
-			return repoURL, false, nil
+			cloneURL := "https://bitbucket.org/" + workspace + "/" + slug + ".git"
+			if err := a.Pusher.SetOrigin(ctx, m.WorktreePath(), cloneURL); err != nil {
+				return repoURL, false, fmt.Errorf("ensure repo: point worktree at repo: %w", err)
+			}
+			return cloneURL, cloneURL != repoURL, nil
 		}
 		if !createIfMissing {
 			return repoURL, false, fmt.Errorf("ensure repo: repo %s/%s does not exist and create_if_missing is not set", workspace, slug)

@@ -113,8 +113,11 @@ func TestBitbucketEnsureRepo(t *testing.T) {
 		wantUpdated     bool
 		wantErr         string
 		wantCreateCalls int
+		wantOrigin      int
 	}{
-		{name: "exists", repoURL: "https://bitbucket.org/acme/widgets.git", pr: &fakePRSource{repoExists: true}, wantURL: "https://bitbucket.org/acme/widgets.git"},
+		{name: "exists", repoURL: "https://bitbucket.org/acme/widgets.git", pr: &fakePRSource{repoExists: true}, wantURL: "https://bitbucket.org/acme/widgets.git", wantOrigin: 1},
+		{name: "exists, browser url is canonicalised", repoURL: "https://bitbucket.org/acme/widgets/src/main/", pr: &fakePRSource{repoExists: true},
+			wantURL: "https://bitbucket.org/acme/widgets.git", wantUpdated: true, wantOrigin: 1},
 		{name: "missing, create", repoURL: "https://bitbucket.org/acme/widgets.git", createIfMissing: true,
 			pr: &fakePRSource{newCloneURL: "https://bitbucket.org/acme/widgets-2.git"}, wantURL: "https://bitbucket.org/acme/widgets-2.git", wantUpdated: true, wantCreateCalls: 1},
 		{name: "missing, no create", repoURL: "https://bitbucket.org/acme/widgets.git", pr: &fakePRSource{}, wantErr: "does not exist and create_if_missing is not set"},
@@ -143,8 +146,12 @@ func TestBitbucketEnsureRepo(t *testing.T) {
 			if got != tc.wantURL || updated != tc.wantUpdated {
 				t.Fatalf("ensureRepo = (%q, %v), want (%q, %v)", got, updated, tc.wantURL, tc.wantUpdated)
 			}
-			if tc.pr.createRepoCalls != tc.wantCreateCalls || p.setOriginCalls != tc.wantCreateCalls {
-				t.Fatalf("createRepo calls = %d, setOrigin calls = %d, want %d", tc.pr.createRepoCalls, p.setOriginCalls, tc.wantCreateCalls)
+			wantOrigin := tc.wantOrigin
+			if wantOrigin == 0 {
+				wantOrigin = tc.wantCreateCalls
+			}
+			if tc.pr.createRepoCalls != tc.wantCreateCalls || p.setOriginCalls != wantOrigin {
+				t.Fatalf("createRepo calls = %d (want %d), setOrigin calls = %d (want %d)", tc.pr.createRepoCalls, tc.wantCreateCalls, p.setOriginCalls, wantOrigin)
 			}
 		})
 	}
