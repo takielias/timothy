@@ -359,6 +359,11 @@ describe('ConnectorAdd bitbucket flow', () => {
     expect(screen.getByPlaceholderText('bitbucket')).toBeInTheDocument()
     expect(screen.queryByPlaceholderText('https://…/mcp')).not.toBeInTheDocument()
     expect(screen.getByText('Access token')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'How to create one →' })).toHaveAttribute(
+      'href',
+      'https://support.atlassian.com/bitbucket-cloud/docs/access-tokens/',
+    )
+    expect(screen.queryByText('Create one on GitHub →')).toBeNull()
   })
 
   it('keeps Test disabled until a token is pasted', async () => {
@@ -395,6 +400,19 @@ describe('ConnectorAdd bitbucket flow', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Add connector' }))
     await waitFor(() => expect(patchConnector).toHaveBeenCalledWith('conn-bb', { enabled: true }))
+  })
+
+  it('saves the workspace into config when given', async () => {
+    vi.mocked(createConnector).mockResolvedValue('conn-bb-ws')
+    vi.mocked(testConnector).mockResolvedValue({ ok: true })
+    renderPage('bitbucket-account')
+
+    fireEvent.change(await screen.findByPlaceholderText('acme-team'), { target: { value: ' acme-team ' } })
+    fireEvent.change(screen.getByPlaceholderText('workspace or repository access token'), { target: { value: 'bb-token' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }))
+
+    await waitFor(() => expect(createConnector).toHaveBeenCalled())
+    expect(vi.mocked(createConnector).mock.calls[0][0]).toMatchObject({ kind: 'bitbucket', config: { workspace: 'acme-team' } })
   })
 
   it('does not stutter the ref when the name already ends in bitbucket', async () => {

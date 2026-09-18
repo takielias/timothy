@@ -121,7 +121,7 @@ func TestFetchBitbucketIdentity(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := bitbucketFakeServer(t, tc.handler)
 
-			got, err := fetchBitbucketIdentity(t.Context(), srv.Client(), "test-token")
+			got, err := fetchBitbucketIdentity(t.Context(), srv.Client(), "test-token", "")
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
@@ -177,7 +177,7 @@ func TestFetchBitbucketIdentityNeverLogsToken(t *testing.T) {
 		w.WriteHeader(http.StatusUnauthorized)
 	})
 
-	_, err := fetchBitbucketIdentity(t.Context(), srv.Client(), "secret-token")
+	_, err := fetchBitbucketIdentity(t.Context(), srv.Client(), "secret-token", "")
 	if err == nil || strings.Contains(err.Error(), "secret-token") {
 		t.Fatalf("err = %v, must never contain the token", err)
 	}
@@ -273,7 +273,7 @@ func TestFetchBitbucketReposFollowsNext(t *testing.T) {
 		}
 	})
 
-	repos, err := fetchBitbucketRepos(t.Context(), srv.Client(), "test-token")
+	repos, err := fetchBitbucketRepos(t.Context(), srv.Client(), "test-token", "")
 	if err != nil {
 		t.Fatalf("fetchBitbucketRepos: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestFetchBitbucketReposCapsAtMax(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"values": full, "next": bitbucketAPIBase + "/repositories?page=more"})
 	})
 
-	repos, err := fetchBitbucketRepos(t.Context(), srv.Client(), "test-token")
+	repos, err := fetchBitbucketRepos(t.Context(), srv.Client(), "test-token", "")
 	if err != nil {
 		t.Fatalf("fetchBitbucketRepos: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestFetchBitbucketReposStatusError(t *testing.T) {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`{"type":"error","error":{"message":"Access token has insufficient scope"}}`))
 	})
-	_, err := fetchBitbucketRepos(t.Context(), srv.Client(), "test-token")
+	_, err := fetchBitbucketRepos(t.Context(), srv.Client(), "test-token", "")
 	if err == nil || !strings.Contains(err.Error(), "list repos: bitbucket: status 403: Access token has insufficient scope") {
 		t.Fatalf("err = %v", err)
 	}
@@ -394,19 +394,19 @@ func TestBitbucketDecodeErrors(t *testing.T) {
 		{
 			name:    "/user",
 			bad:     "/user",
-			call:    func(c *http.Client) error { _, err := fetchBitbucketIdentity(t.Context(), c, "tok"); return err },
+			call:    func(c *http.Client) error { _, err := fetchBitbucketIdentity(t.Context(), c, "tok", ""); return err },
 			wantErr: "decode /user:",
 		},
 		{
 			name:    "/user/emails",
 			bad:     "/user/emails",
-			call:    func(c *http.Client) error { _, err := fetchBitbucketIdentity(t.Context(), c, "tok"); return err },
+			call:    func(c *http.Client) error { _, err := fetchBitbucketIdentity(t.Context(), c, "tok", ""); return err },
 			wantErr: "decode /user/emails:",
 		},
 		{
 			name:    "/repositories",
 			bad:     "/repositories",
-			call:    func(c *http.Client) error { _, err := fetchBitbucketRepos(t.Context(), c, "tok"); return err },
+			call:    func(c *http.Client) error { _, err := fetchBitbucketRepos(t.Context(), c, "tok", ""); return err },
 			wantErr: "list repos:",
 		},
 	} {
@@ -432,7 +432,7 @@ func TestBitbucketRequestErrors(t *testing.T) {
 		prev := bitbucketAPIBase
 		bitbucketAPIBase = "http://[::1]:namedport"
 		t.Cleanup(func() { bitbucketAPIBase = prev })
-		_, err := fetchBitbucketIdentity(t.Context(), &http.Client{}, "secret-token")
+		_, err := fetchBitbucketIdentity(t.Context(), &http.Client{}, "secret-token", "")
 		if err == nil || strings.Contains(err.Error(), "secret-token") {
 			t.Fatalf("err = %v", err)
 		}
@@ -440,7 +440,7 @@ func TestBitbucketRequestErrors(t *testing.T) {
 	t.Run("connection refused", func(t *testing.T) {
 		srv := bitbucketFakeServer(t, func(http.ResponseWriter, *http.Request) {})
 		srv.Close()
-		_, err := fetchBitbucketRepos(t.Context(), &http.Client{}, "secret-token")
+		_, err := fetchBitbucketRepos(t.Context(), &http.Client{}, "secret-token", "")
 		if err == nil || strings.Contains(err.Error(), "secret-token") {
 			t.Fatalf("err = %v", err)
 		}
@@ -472,7 +472,7 @@ func TestBitbucketEmailRequestError(t *testing.T) {
 		}
 		_ = conn.Close()
 	})
-	_, err := fetchBitbucketIdentity(t.Context(), srv.Client(), "secret-token")
+	_, err := fetchBitbucketIdentity(t.Context(), srv.Client(), "secret-token", "")
 	if err == nil || strings.Contains(err.Error(), "secret-token") {
 		t.Fatalf("err = %v", err)
 	}
@@ -487,7 +487,7 @@ func TestFetchBitbucketReposTrimsOversizedLastPage(t *testing.T) {
 	srv := bitbucketFakeServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"values": big, "next": bitbucketAPIBase + "/repositories?page=more"})
 	})
-	repos, err := fetchBitbucketRepos(t.Context(), srv.Client(), "tok")
+	repos, err := fetchBitbucketRepos(t.Context(), srv.Client(), "tok", "")
 	if err != nil {
 		t.Fatalf("fetchBitbucketRepos: %v", err)
 	}
@@ -781,5 +781,122 @@ func TestBitbucketFindExistingPRConnectionDrops(t *testing.T) {
 	_, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).CreatePR(t.Context(), "acme", "widgets", "t", "h", "b", "")
 	if err == nil || !strings.Contains(err.Error(), "could not fetch existing") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// A workspace or repository access token is not a user: /user answers 403
+// and the token is verified against its configured workspace instead.
+func TestFetchBitbucketIdentityAccessToken(t *testing.T) {
+	notAUser := func(w http.ResponseWriter) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"message":"This API is not accessible by this authentication mechanism"}}`))
+	}
+	for _, tc := range []struct {
+		name      string
+		workspace string
+		handler   func(w http.ResponseWriter)
+		want      GitHubIdentity
+		wantErr   string
+	}{
+		{
+			name:      "named by its workspace",
+			workspace: "acme-team",
+			handler: func(w http.ResponseWriter) {
+				_, _ = w.Write([]byte(`{"slug":"acme-team","name":"Acme Team"}`))
+			},
+			want: GitHubIdentity{Login: "acme-team", Name: "Acme Team (access token)", Email: "", Scopes: "workspace or repository access token"},
+		},
+		{
+			name:    "no workspace configured is a clear error",
+			wantErr: "set the connector's workspace",
+		},
+		{
+			name:      "workspace not visible to the token",
+			workspace: "other",
+			handler: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"type":"error","error":{"message":"No workspace with identifier 'other'."}}`))
+			},
+			wantErr: "identify access token: bitbucket: status 404: No workspace with identifier 'other'.",
+		},
+		{
+			name:      "workspace bad body",
+			workspace: "acme-team",
+			handler:   func(w http.ResponseWriter) { _, _ = w.Write([]byte(`{nope`)) },
+			wantErr:   "decode /workspaces",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var emailCalls int
+			srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/user":
+					notAUser(w)
+				case "/workspaces/" + tc.workspace:
+					tc.handler(w)
+				case "/user/emails":
+					emailCalls++
+				default:
+					t.Errorf("unexpected path %s", r.URL.Path)
+				}
+			})
+			got, err := fetchBitbucketIdentity(t.Context(), srv.Client(), "tok", tc.workspace)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("identity = %+v, err %v, want %+v", got, err, tc.want)
+			}
+			if emailCalls != 0 {
+				t.Fatalf("/user/emails called %d times for a non-user token", emailCalls)
+			}
+		})
+	}
+}
+
+func TestFetchBitbucketIdentityAccessTokenConnectionDrops(t *testing.T) {
+	srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		_ = conn.Close()
+	})
+	_, err := fetchBitbucketIdentity(t.Context(), srv.Client(), "secret-token", "acme-team")
+	if err == nil || strings.Contains(err.Error(), "secret-token") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestBitbucketBuilderConfig(t *testing.T) {
+	t.Parallel()
+	b := BitbucketBuilder(nil)
+	resolve := func(_ context.Context, _ string) (string, error) { return "tok", nil }
+	src, err := b(t.Context(), Connector{Name: "bb", Kind: "bitbucket", CredentialRef: "R", Config: json.RawMessage(`{"workspace":" acme-team "}`)}, resolve)
+	if err != nil || src.(*bitbucketSource).workspace != "acme-team" {
+		t.Fatalf("workspace = %q, err %v", src.(*bitbucketSource).workspace, err)
+	}
+	if _, err := b(t.Context(), Connector{Name: "bb", Kind: "bitbucket", CredentialRef: "R", Config: json.RawMessage(`{nope`)}, resolve); err == nil {
+		t.Fatal("bad config accepted")
+	}
+}
+
+func TestFetchBitbucketReposScopedToWorkspace(t *testing.T) {
+	srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repositories/acme-team" || r.URL.Query().Get("role") != "" {
+			t.Errorf("request = %s", r.URL.RequestURI())
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"values": []map[string]any{bitbucketRepoJSON("acme-team/widgets", "main")}})
+	})
+	repos, err := fetchBitbucketRepos(t.Context(), srv.Client(), "tok", "acme-team")
+	if err != nil || len(repos) != 1 || repos[0].FullName != "acme-team/widgets" {
+		t.Fatalf("repos = %+v, err %v", repos, err)
 	}
 }

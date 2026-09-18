@@ -102,6 +102,7 @@ export function ConnectorAdd() {
   const [caldavUsername, setCaldavUsername] = useState('')
   const [caldavPassword, setCaldavPassword] = useState('')
   const [awsRegion, setAwsRegion] = useState('')
+  const [bitbucketWorkspace, setBitbucketWorkspace] = useState('')
   const [awsAccessKeyID, setAwsAccessKeyID] = useState('')
   const [awsSecretAccessKey, setAwsSecretAccessKey] = useState('')
   const [gcpProjectID, setGcpProjectID] = useState('')
@@ -263,8 +264,16 @@ export function ConnectorAdd() {
               : token
       if (!usingExistingToken && secretValue) await setSecret(tokenRef, secretValue.trim())
       const id = await createConnector(
-        isGitHub || isBitbucket
-          ? { name: slug, kind: preset.kind, config: {}, credential_ref: tokenRef, enabled: false }
+        isGitHub
+          ? { name: slug, kind: 'github', config: {}, credential_ref: tokenRef, enabled: false }
+          : isBitbucket
+            ? {
+                name: slug,
+                kind: 'bitbucket',
+                config: bitbucketWorkspace.trim() ? { workspace: bitbucketWorkspace.trim() } : {},
+                credential_ref: tokenRef,
+                enabled: false,
+              }
           : isImap
             ? {
                 name: slug,
@@ -524,6 +533,22 @@ export function ConnectorAdd() {
                     )}
                   </Field>
                 </>
+              )}
+              {isBitbucket && (
+                <Field
+                  label="Workspace"
+                  description="required for a workspace or repository access token; a personal API token can leave it blank"
+                  required={false}
+                >
+                  <Input
+                    value={bitbucketWorkspace}
+                    onChange={(e) => {
+                      setBitbucketWorkspace(e.target.value)
+                      invalidate()
+                    }}
+                    placeholder="acme-team"
+                  />
+                </Field>
               )}
               {isGCP && (
                 <>
@@ -792,7 +817,7 @@ export function ConnectorAdd() {
                         rel="noreferrer"
                         className="font-medium text-primary underline underline-offset-2 hover:no-underline"
                       >
-                        Create one on GitHub →
+                        {isBitbucket ? 'How to create one →' : 'Create one on GitHub →'}
                       </a>
                     </>
                   )}
