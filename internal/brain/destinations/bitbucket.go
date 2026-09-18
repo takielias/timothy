@@ -95,7 +95,7 @@ func (a *BitbucketAdapter) ensureRepo(ctx context.Context, m missions.Mission, c
 		if !createIfMissing {
 			return repoURL, false, fmt.Errorf("ensure repo: repo %s/%s does not exist and create_if_missing is not set", workspace, slug)
 		}
-		cloneURL, err := a.PR.CreateRepo(ctx, connectorID, slug, true)
+		cloneURL, err := a.PR.CreateRepo(ctx, connectorID, workspace+"/"+slug, true)
 		if err != nil {
 			return repoURL, false, fmt.Errorf("ensure repo: create %s/%s: %w", workspace, slug, err)
 		}

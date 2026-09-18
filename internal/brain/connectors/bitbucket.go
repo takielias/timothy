@@ -1,11 +1,13 @@
 package connectors
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -287,4 +289,173 @@ func bitbucketStatusError(resp *http.Response) error {
 		return fmt.Errorf("bitbucket: status %d: %s", resp.StatusCode, msg)
 	}
 	return fmt.Errorf("bitbucket: status %d", resp.StatusCode)
+}
+
+// GetRepo resolves workspace/slug; a 404 is ErrRepoNotFound so the
+// destination's existence check can tell "absent" from "failed".
+func (s *bitbucketSource) GetRepo(ctx context.Context, workspace, slug string) (GitHubRepo, error) {
+	token, err := s.resolve(ctx, s.credentialRef)
+	if err != nil {
+		return GitHubRepo{}, fmt.Errorf("resolve credential_ref %q: %w", s.credentialRef, err)
+	}
+	resp, err := bitbucketRequest(ctx, s.client, token, fmt.Sprintf("/repositories/%s/%s", workspace, slug))
+	if err != nil {
+		return GitHubRepo{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return GitHubRepo{}, fmt.Errorf("get repo: %w", ErrRepoNotFound)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return GitHubRepo{}, fmt.Errorf("get repo: %w", bitbucketStatusError(resp))
+	}
+	var r bitbucketRepo
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return GitHubRepo{}, fmt.Errorf("get repo: decode response: %w", err)
+	}
+	return r.toGitHubRepo(), nil
+}
+
+// CreateRepo takes name as workspace/slug: Bitbucket repos live in a
+// workspace and the token does not say which one.
+func (s *bitbucketSource) CreateRepo(ctx context.Context, name string, private bool) (GitHubRepo, error) {
+	workspace, slug, err := splitBitbucketRepoArg(name)
+	if err != nil {
+		return GitHubRepo{}, fmt.Errorf("create repo: bitbucket needs a workspace/slug name, got %q", name)
+	}
+	token, err := s.resolve(ctx, s.credentialRef)
+	if err != nil {
+		return GitHubRepo{}, fmt.Errorf("resolve credential_ref %q: %w", s.credentialRef, err)
+	}
+	resp, err := bitbucketPost(ctx, s.client, token, fmt.Sprintf("/repositories/%s/%s", workspace, slug),
+		map[string]any{"scm": "git", "is_private": private})
+	if err != nil {
+		return GitHubRepo{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return GitHubRepo{}, fmt.Errorf("create repo: %w", bitbucketStatusError(resp))
+	}
+	var r bitbucketRepo
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return GitHubRepo{}, fmt.Errorf("create repo: decode response: %w", err)
+	}
+	return r.toGitHubRepo(), nil
+}
+
+// bitbucketPRRef is the slice of a pull request CreatePR and PRMerged read.
+type bitbucketPRRef struct {
+	ID    int    `json:"id"`
+	State string `json:"state"`
+	Links struct {
+		HTML struct {
+			Href string `json:"href"`
+		} `json:"html"`
+	} `json:"links"`
+}
+
+func (p bitbucketPRRef) toGitHubPR() GitHubPR {
+	return GitHubPR{Number: p.ID, HTMLURL: p.Links.HTML.Href, State: strings.ToLower(p.State)}
+}
+
+// CreatePR opens a pull request from head to base, or returns the open
+// one for head when Bitbucket refuses a duplicate.
+func (s *bitbucketSource) CreatePR(ctx context.Context, workspace, slug, title, head, base, body string) (GitHubPR, error) {
+	token, err := s.resolve(ctx, s.credentialRef)
+	if err != nil {
+		return GitHubPR{}, fmt.Errorf("resolve credential_ref %q: %w", s.credentialRef, err)
+	}
+	resp, err := bitbucketPost(ctx, s.client, token, fmt.Sprintf("/repositories/%s/%s/pullrequests", workspace, slug), map[string]any{
+		"title":       title,
+		"description": body,
+		"source":      map[string]any{"branch": map[string]any{"name": head}},
+		"destination": map[string]any{"branch": map[string]any{"name": base}},
+	})
+	if err != nil {
+		return GitHubPR{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		var pr bitbucketPRRef
+		if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+			return GitHubPR{}, fmt.Errorf("create pr: decode response: %w", err)
+		}
+		return pr.toGitHubPR(), nil
+	}
+	createErr := fmt.Errorf("create pr: %w", bitbucketStatusError(resp))
+	if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusConflict {
+		return GitHubPR{}, createErr
+	}
+	existing, findErr := findOpenBitbucketPR(ctx, s.client, token, workspace, slug, head)
+	if findErr != nil {
+		return GitHubPR{}, fmt.Errorf("%w (and could not fetch existing: %v)", createErr, findErr)
+	}
+	if existing == nil {
+		return GitHubPR{}, createErr
+	}
+	return *existing, nil
+}
+
+func findOpenBitbucketPR(ctx context.Context, client *http.Client, token, workspace, slug, head string) (*GitHubPR, error) {
+	q := url.Values{"q": {fmt.Sprintf(`source.branch.name="%s"`, head)}, "state": {"OPEN"}, "pagelen": {"1"}}
+	resp, err := bitbucketRequest(ctx, client, token, fmt.Sprintf("/repositories/%s/%s/pullrequests?%s", workspace, slug, q.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, bitbucketStatusError(resp)
+	}
+	var page bitbucketPage[bitbucketPRRef]
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if len(page.Values) == 0 {
+		return nil, nil
+	}
+	pr := page.Values[0].toGitHubPR()
+	return &pr, nil
+}
+
+func (s *bitbucketSource) PRMerged(ctx context.Context, workspace, slug string, number int) (bool, error) {
+	token, err := s.resolve(ctx, s.credentialRef)
+	if err != nil {
+		return false, fmt.Errorf("resolve credential_ref %q: %w", s.credentialRef, err)
+	}
+	resp, err := bitbucketRequest(ctx, s.client, token, fmt.Sprintf("/repositories/%s/%s/pullrequests/%d", workspace, slug, number))
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("get pr: %w", bitbucketStatusError(resp))
+	}
+	var pr bitbucketPRRef
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return false, fmt.Errorf("get pr: decode response: %w", err)
+	}
+	return pr.State == "MERGED", nil
+}
+
+func bitbucketPost(ctx context.Context, client *http.Client, token, path string, body any) (*http.Response, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	cctx, cancel := context.WithTimeout(ctx, bitbucketCallTimeout)
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, bitbucketAPIBase+path, bytes.NewReader(payload))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
 }

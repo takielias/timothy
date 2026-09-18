@@ -3,6 +3,7 @@ package connectors
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -492,5 +493,293 @@ func TestFetchBitbucketReposTrimsOversizedLastPage(t *testing.T) {
 	}
 	if len(repos) != bitbucketRepoMaxRepos {
 		t.Fatalf("len(repos) = %d, want exactly %d", len(repos), bitbucketRepoMaxRepos)
+	}
+}
+
+func TestBitbucketGetRepo(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		body    string
+		want    string
+		wantErr error
+	}{
+		{"found", http.StatusOK, `{"full_name":"acme/widgets","mainbranch":{"name":"develop"},"links":{"clone":[{"name":"https","href":"https://bitbucket.org/acme/widgets.git"}]}}`, "develop", nil},
+		{"404 is the not-found sentinel", http.StatusNotFound, "Not Found", "", ErrRepoNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/repositories/acme/widgets" {
+					t.Errorf("path = %s", r.URL.Path)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			repo, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).GetRepo(t.Context(), "acme", "widgets")
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || repo.DefaultBranch != tc.want || repo.CloneURL != "https://bitbucket.org/acme/widgets.git" {
+				t.Fatalf("repo = %+v, err %v", repo, err)
+			}
+		})
+	}
+}
+
+func TestBitbucketCreateRepo(t *testing.T) {
+	t.Run("posts scm and visibility to workspace/slug", func(t *testing.T) {
+		srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || r.URL.Path != "/repositories/acme/widgets" {
+				t.Errorf("%s %s", r.Method, r.URL.Path)
+			}
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["scm"] != "git" || body["is_private"] != true {
+				t.Errorf("body = %v", body)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"full_name":"acme/widgets","links":{"clone":[{"name":"https","href":"https://bitbucket.org/acme/widgets.git"}]}}`))
+		})
+		repo, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).CreateRepo(t.Context(), "acme/widgets", true)
+		if err != nil || repo.CloneURL != "https://bitbucket.org/acme/widgets.git" {
+			t.Fatalf("repo = %+v, err %v", repo, err)
+		}
+	})
+	t.Run("a bare name has no workspace", func(t *testing.T) {
+		srv := bitbucketFakeServer(t, func(http.ResponseWriter, *http.Request) { t.Error("must not call the API") })
+		_, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).CreateRepo(t.Context(), "widgets", true)
+		if err == nil || !strings.Contains(err.Error(), "workspace/slug") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("api error", func(t *testing.T) {
+		srv := bitbucketFakeServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"message":"project key is required"}}`))
+		})
+		_, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).CreateRepo(t.Context(), "acme/widgets", true)
+		if err == nil || !strings.Contains(err.Error(), "create repo: bitbucket: status 400: project key is required") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestBitbucketCreatePR(t *testing.T) {
+	const created = `{"id":12,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/acme/widgets/pull-requests/12"}}}`
+	t.Run("created", func(t *testing.T) {
+		srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			src := body["source"].(map[string]any)["branch"].(map[string]any)["name"]
+			dst := body["destination"].(map[string]any)["branch"].(map[string]any)["name"]
+			if body["title"] != "feat: thing" || src != "feat/x" || dst != "main" {
+				t.Errorf("body = %v", body)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(created))
+		})
+		pr, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).CreatePR(t.Context(), "acme", "widgets", "feat: thing", "feat/x", "main", "body")
+		if err != nil || pr.Number != 12 || pr.HTMLURL != "https://bitbucket.org/acme/widgets/pull-requests/12" || pr.State != "open" {
+			t.Fatalf("pr = %+v, err %v", pr, err)
+		}
+	})
+	t.Run("duplicate returns the existing open pr", func(t *testing.T) {
+		srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodPost:
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"type":"error","error":{"message":"There is already a pull request open"}}`))
+			case http.MethodGet:
+				if r.URL.Query().Get("q") != `source.branch.name="feat/x"` || r.URL.Query().Get("state") != "OPEN" {
+					t.Errorf("query = %s", r.URL.RawQuery)
+				}
+				_, _ = w.Write([]byte(`{"values":[` + created + `]}`))
+			}
+		})
+		pr, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).CreatePR(t.Context(), "acme", "widgets", "t", "feat/x", "main", "")
+		if err != nil || pr.Number != 12 {
+			t.Fatalf("pr = %+v, err %v", pr, err)
+		}
+	})
+	t.Run("400 with no existing pr keeps the original error", func(t *testing.T) {
+		srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"type":"error","error":{"message":"destination branch missing"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"values":[]}`))
+		})
+		_, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).CreatePR(t.Context(), "acme", "widgets", "t", "feat/x", "main", "")
+		if err == nil || !strings.Contains(err.Error(), "create pr: bitbucket: status 400: destination branch missing") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("403 does not look for an existing pr", func(t *testing.T) {
+		var gets int
+		srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				gets++
+			}
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"message":"no"}}`))
+		})
+		_, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).CreatePR(t.Context(), "acme", "widgets", "t", "feat/x", "main", "")
+		if err == nil || gets != 0 {
+			t.Fatalf("err = %v, gets = %d", err, gets)
+		}
+	})
+}
+
+func TestBitbucketPRMerged(t *testing.T) {
+	for _, tc := range []struct {
+		state string
+		want  bool
+	}{{"MERGED", true}, {"OPEN", false}, {"DECLINED", false}} {
+		t.Run(tc.state, func(t *testing.T) {
+			srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/repositories/acme/widgets/pullrequests/12" {
+					t.Errorf("path = %s", r.URL.Path)
+				}
+				_, _ = w.Write([]byte(`{"id":12,"state":"` + tc.state + `"}`))
+			})
+			merged, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).PRMerged(t.Context(), "acme", "widgets", 12)
+			if err != nil || merged != tc.want {
+				t.Fatalf("merged = %v, err %v", merged, err)
+			}
+		})
+	}
+}
+
+// With all five methods present the manager's repoSource assertion admits
+// the kind: this is what the mission repo picker and the PR flow go through.
+func TestManagerRepoSourceAdmitsBitbucket(t *testing.T) {
+	srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repositories" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{"values": []map[string]any{bitbucketRepoJSON("acme/widgets", "main")}})
+		case r.URL.Path == "/repositories/acme/widgets/pullrequests/3":
+			_, _ = w.Write([]byte(`{"id":3,"state":"MERGED"}`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	})
+	m := testManager(fakeRows{rows: []Connector{{ID: "1", Name: "work-bb", Kind: "bitbucket", CredentialRef: "BB_TOKEN"}}})
+	m.RegisterBuilder("bitbucket", BitbucketBuilder(srv.Client()))
+
+	repos, err := m.ListRepos(t.Context(), "1")
+	if err != nil || len(repos) != 1 || repos[0].FullName != "acme/widgets" {
+		t.Fatalf("ListRepos = %+v, %v", repos, err)
+	}
+	merged, err := m.PRMerged(t.Context(), "1", "acme", "widgets", 3)
+	if err != nil || !merged {
+		t.Fatalf("PRMerged = %v, %v", merged, err)
+	}
+}
+
+// Error paths shared by the repo and PR methods: a failing resolver, a
+// non-200 status, a bad body, and a request that cannot be built.
+func TestBitbucketRepoMethodErrors(t *testing.T) {
+	calls := func(s *bitbucketSource) map[string]func() error {
+		return map[string]func() error{
+			"GetRepo":    func() error { _, err := s.GetRepo(t.Context(), "acme", "widgets"); return err },
+			"CreateRepo": func() error { _, err := s.CreateRepo(t.Context(), "acme/widgets", true); return err },
+			"CreatePR":   func() error { _, err := s.CreatePR(t.Context(), "acme", "widgets", "t", "h", "b", ""); return err },
+			"PRMerged":   func() error { _, err := s.PRMerged(t.Context(), "acme", "widgets", 1); return err },
+		}
+	}
+
+	t.Run("resolver failure makes no request", func(t *testing.T) {
+		srv := bitbucketFakeServer(t, func(http.ResponseWriter, *http.Request) { t.Error("must not call the API") })
+		for name, call := range calls(bitbucketSourceWith(t, srv.Client(), "", fmt.Errorf("vault sealed"))) {
+			if err := call(); err == nil || !strings.Contains(err.Error(), "vault sealed") {
+				t.Errorf("%s: err = %v", name, err)
+			}
+		}
+	})
+	t.Run("server error", func(t *testing.T) {
+		srv := bitbucketFakeServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("boom"))
+		})
+		for name, call := range calls(bitbucketSourceWith(t, srv.Client(), "tok", nil)) {
+			if err := call(); err == nil || !strings.Contains(err.Error(), "status 500: boom") {
+				t.Errorf("%s: err = %v", name, err)
+			}
+		}
+	})
+	t.Run("bad body", func(t *testing.T) {
+		srv := bitbucketFakeServer(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{nope`)) })
+		for name, call := range calls(bitbucketSourceWith(t, srv.Client(), "tok", nil)) {
+			if err := call(); err == nil || !strings.Contains(err.Error(), "decode response") {
+				t.Errorf("%s: err = %v", name, err)
+			}
+		}
+	})
+	t.Run("unbuildable url", func(t *testing.T) {
+		prev := bitbucketAPIBase
+		bitbucketAPIBase = "http://[::1]:namedport"
+		t.Cleanup(func() { bitbucketAPIBase = prev })
+		for name, call := range calls(bitbucketSourceWith(t, &http.Client{}, "secret-token", nil)) {
+			if err := call(); err == nil || strings.Contains(err.Error(), "secret-token") {
+				t.Errorf("%s: err = %v", name, err)
+			}
+		}
+	})
+	t.Run("duplicate pr but the lookup fails", func(t *testing.T) {
+		for _, lookup := range []struct {
+			name, body string
+			status     int
+		}{
+			{"status", `{"type":"error","error":{"message":"denied"}}`, http.StatusForbidden},
+			{"decode", `{nope`, http.StatusOK},
+		} {
+			t.Run(lookup.name, func(t *testing.T) {
+				srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodPost {
+						w.WriteHeader(http.StatusConflict)
+						_, _ = w.Write([]byte(`{"type":"error","error":{"message":"exists"}}`))
+						return
+					}
+					w.WriteHeader(lookup.status)
+					_, _ = w.Write([]byte(lookup.body))
+				})
+				_, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).CreatePR(t.Context(), "acme", "widgets", "t", "h", "b", "")
+				if err == nil || !strings.Contains(err.Error(), "status 409: exists") || !strings.Contains(err.Error(), "could not fetch existing") {
+					t.Fatalf("err = %v", err)
+				}
+			})
+		}
+	})
+}
+
+func TestBitbucketPostConnectionRefused(t *testing.T) {
+	srv := bitbucketFakeServer(t, func(http.ResponseWriter, *http.Request) {})
+	srv.Close()
+	_, err := bitbucketSourceWith(t, &http.Client{}, "secret-token", nil).CreatePR(t.Context(), "acme", "widgets", "t", "h", "b", "")
+	if err == nil || strings.Contains(err.Error(), "secret-token") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestBitbucketFindExistingPRConnectionDrops(t *testing.T) {
+	srv := bitbucketFakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"message":"exists"}}`))
+			return
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		_ = conn.Close()
+	})
+	_, err := bitbucketSourceWith(t, srv.Client(), "tok", nil).CreatePR(t.Context(), "acme", "widgets", "t", "h", "b", "")
+	if err == nil || !strings.Contains(err.Error(), "could not fetch existing") {
+		t.Fatalf("err = %v", err)
 	}
 }

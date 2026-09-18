@@ -2267,8 +2267,8 @@ func (h *missionAPI) resolvePushToken(ctx context.Context, m missions.Mission, c
 	if err != nil {
 		return "", &pushTokenError{http.StatusBadRequest, "bad_request", "unknown connector_id"}
 	}
-	if c.Kind != "github" {
-		return "", &pushTokenError{http.StatusBadRequest, "bad_request", "connector_id must name a github-kind connector"}
+	if c.Kind != "github" && c.Kind != "bitbucket" {
+		return "", &pushTokenError{http.StatusBadRequest, "bad_request", "connector_id must name a github- or bitbucket-kind connector"}
 	}
 	if !c.Enabled {
 		return "", &pushTokenError{http.StatusBadRequest, "bad_request", "connector is disabled"}
@@ -2447,7 +2447,14 @@ func (h *missionAPI) pr(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "bad_request", "connectors are not enabled")
 		return
 	}
-	if _, _, ok := missions.ParseGitHubRepoURL(repoURL); !ok {
+	src, _ := m.RepoSource()
+	isBitbucket := src.Source == missions.SourceKindBitbucket
+	if isBitbucket {
+		if _, _, ok := missions.ParseBitbucketRepoURL(repoURL); !ok {
+			jsonError(w, http.StatusBadRequest, "bad_request", "mission repo_url is not a recognizable bitbucket https clone URL")
+			return
+		}
+	} else if _, _, ok := missions.ParseGitHubRepoURL(repoURL); !ok {
 		jsonError(w, http.StatusBadRequest, "bad_request", "mission repo_url is not a recognizable github https clone URL")
 		return
 	}
@@ -2462,7 +2469,13 @@ func (h *missionAPI) pr(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadGateway, "push_failed", err.Error())
 		return
 	}
-	url, number, err := h.completer().OpenPR(r.Context(), m, token)
+	var url string
+	var number int
+	if isBitbucket {
+		url, number, err = destinations.NewBitbucketAdapter(h.workspace, h.store, nil, h.prSource()).OpenPR(r.Context(), m, token)
+	} else {
+		url, number, err = h.completer().OpenPR(r.Context(), m, token)
+	}
 	if err != nil {
 		if errors.Is(err, missions.ErrRemoteUnsupported) || errors.Is(err, missions.ErrPushRejected) {
 			status, code := pushStatusCode(err)
