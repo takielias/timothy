@@ -33,7 +33,7 @@ export function DestinationKindFields({
   setField,
   connectors,
 }: {
-  kind: 'email' | 'webhook' | 'telegram' | 'github'
+  kind: 'email' | 'webhook' | 'telegram' | 'github' | 'bitbucket'
   values: DestinationKindValues
   setField: <K extends keyof DestinationKindValues>(key: K, value: DestinationKindValues[K]) => void
   connectors: AdminConnector[]
@@ -99,15 +99,15 @@ export function DestinationKindFields({
 
   return (
     <>
-      <Field label="GitHub connector">
+      <Field label={kind === 'bitbucket' ? 'Bitbucket connector' : 'GitHub connector'}>
         {(props) => (
           <Select value={values.connectorID} onValueChange={(v) => setField('connectorID', v)}>
-            <SelectTrigger id={props.id} className="w-full" aria-label="GitHub connector">
-              <SelectValue placeholder="Choose a connected GitHub account" />
+            <SelectTrigger id={props.id} className="w-full" aria-label={kind === 'bitbucket' ? 'Bitbucket connector' : 'GitHub connector'}>
+              <SelectValue placeholder={kind === 'bitbucket' ? 'Choose a connected Bitbucket account' : 'Choose a connected GitHub account'} />
             </SelectTrigger>
             <SelectContent>
               {connectors
-                .filter((c) => c.kind === 'github')
+                .filter((c) => c.kind === kind)
                 .map((c) => (
                   <SelectItem key={c.id} value={c.id}>
                     {c.name}

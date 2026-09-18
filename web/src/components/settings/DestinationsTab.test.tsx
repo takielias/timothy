@@ -74,6 +74,16 @@ const githubConnector: AdminConnector = {
   sensitive: false,
 }
 
+const bitbucketConnector: AdminConnector = {
+  id: 'c3',
+  name: 'my-bitbucket',
+  kind: 'bitbucket',
+  config: {},
+  credential_ref: 'MY_BITBUCKET_TOKEN',
+  enabled: true,
+  sensitive: false,
+}
+
 const githubDestination: Destination = {
   id: 'd5',
   name: 'ops-repo',
@@ -647,6 +657,29 @@ describe('Destinations tab', () => {
         },
         enabled: true,
       }),
+    )
+  })
+
+  it('adds a bitbucket destination through a bitbucket connector, no test-send', async () => {
+    vi.mocked(listConnectors).mockResolvedValue([githubConnector, bitbucketConnector])
+    vi.mocked(createDestination).mockResolvedValue('d6')
+    renderTab()
+
+    fireEvent.click(await screen.findByRole('link', { name: /^Bitbucket/ }))
+    fireEvent.change(await screen.findByPlaceholderText('ops-inbox'), { target: { value: 'ops-bb' } })
+    fireEvent.click(await screen.findByLabelText('Bitbucket connector'))
+    expect(screen.queryByRole('option', { name: 'my-github' })).toBeNull()
+    fireEvent.click(await screen.findByRole('option', { name: 'my-bitbucket' }))
+    expect(screen.queryByRole('button', { name: 'Test send' })).toBeNull()
+
+    const addButton = await screen.findByRole('button', { name: 'Add destination' })
+    await waitFor(() => expect((addButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(addButton)
+
+    await waitFor(() =>
+      expect(createDestination).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'ops-bb', kind: 'bitbucket', config: expect.objectContaining({ connector_id: 'c3', mode: 'push' }) }),
+      ),
     )
   })
 
