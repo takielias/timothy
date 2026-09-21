@@ -580,6 +580,45 @@ describe('MissionForm: destinations multi-select', () => {
       ),
     )
   })
+
+  it('leaves a disabled destination out of the list', async () => {
+    vi.mocked(listDestinations).mockResolvedValue([
+      destinations[0],
+      { ...destinations[1], enabled: false },
+    ])
+    renderForm(<MissionForm mode="create" onDone={vi.fn()} onCancel={vi.fn()} />)
+
+    await screen.findByText('Destinations')
+    expect(screen.getByLabelText(/^ops-inbox/)).toBeTruthy()
+    expect(screen.queryByLabelText(/^ops-hook/)).toBeNull()
+  })
+
+  it('still lists a disabled destination an edited schedule already holds', async () => {
+    vi.mocked(listDestinations).mockResolvedValue([
+      destinations[0],
+      { ...destinations[1], enabled: false },
+    ])
+    const seeded: Schedule = {
+      ...schedule,
+      mission_template: { ...schedule.mission_template, destination_ids: ['d2'] },
+    }
+    renderForm(<MissionForm mode="edit" schedule={seeded} onDone={vi.fn()} onCancel={vi.fn()} />)
+
+    await screen.findByText('Destinations')
+    const opsHook = screen.getByLabelText(/^ops-hook/) as HTMLInputElement
+    expect(opsHook.checked).toBe(true)
+    expect(screen.getByText(/disabled - enable it under Settings/)).toBeTruthy()
+  })
+
+  it('hides the section when every destination is disabled', async () => {
+    vi.mocked(listDestinations).mockResolvedValue(
+      destinations.map((d) => ({ ...d, enabled: false })),
+    )
+    renderForm(<MissionForm mode="create" onDone={vi.fn()} onCancel={vi.fn()} />)
+
+    await waitFor(() => expect(listDestinations).toHaveBeenCalled())
+    expect(screen.queryByText('Destinations')).toBeNull()
+  })
 })
 
 describe('MissionForm: follow-up', () => {
