@@ -854,6 +854,14 @@ export function MissionForm({
   // a clone URL: an existing repo picked.
   const githubSourceReady = repoSource !== 'github' || (!!connectorID && !!selectedRepo)
 
+  // A disabled destination is rejected at create with "unknown or
+  // disabled destination id(s)", so it isn't offered — except when a
+  // schedule saved earlier already holds it, where hiding it would drop
+  // it from the form while it still blocks the save.
+  const visibleDestinations = (destinations ?? []).filter(
+    (d) => d.enabled || destinationIDs.includes(d.id),
+  )
+
   // A checked github destination only makes sense on a coding mission
   // (issue #561): the server rejects that combination with 400.
   const checkedGithubDestinations = (destinations ?? []).filter(
@@ -1511,7 +1519,7 @@ export function MissionForm({
           </label>
         )}
 
-        {destinations && destinations.length > 0 && (
+        {visibleDestinations.length > 0 && (
           <div className="space-y-1.5">
             <Label>Destinations</Label>
             <p className="text-xs text-muted-foreground">
@@ -1519,7 +1527,7 @@ export function MissionForm({
             </p>
             <div className="space-y-3 rounded-md border border-border p-3">
               <div className="space-y-1.5">
-                {destinations.map((d) => (
+                {visibleDestinations.map((d) => (
                   <div key={d.id}>
                     <label
                       htmlFor={`mission-destination-${d.id}`}
@@ -1544,6 +1552,11 @@ export function MissionForm({
                       />
                       <span>{d.name}</span>
                       <span className="text-xs text-muted-foreground uppercase">{d.kind}</span>
+                      {!d.enabled && (
+                        <span className="text-xs text-destructive">
+                          disabled - enable it under Settings to use it
+                        </span>
+                      )}
                     </label>
 
                     {isGitKind(d.kind) && destinationIDs.includes(d.id) && (
